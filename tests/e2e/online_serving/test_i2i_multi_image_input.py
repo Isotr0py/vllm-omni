@@ -1,30 +1,27 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
-E2E Online tests for Qwen3-Omni model with video input and audio output.
+E2E online serving test for Qwen-Image-Edit-2509 multi-image input.
 """
 
+import base64
 import os
 import socket
 import subprocess
 import sys
 import time
-from pathlib import Path
+from io import BytesIO
 
 import openai
 import pytest
-from vllm.assets.video import VideoAsset
+from PIL import Image
+from vllm.assets.image import ImageAsset
 from vllm.utils import get_open_port
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
-models = ["Qwen/Qwen3-Omni-30B-A3B-Instruct"]
-
-# CI stage config for 2*H100-80G GPUs
-stage_configs = [str(Path(__file__).parent / "stage_configs" / "qwen3_omni_ci.yaml")]
-
-# Create parameter combinations for model and stage config
-test_params = [(model, stage_config) for model in models for stage_config in stage_configs]
+models = ["Qwen/Qwen-Image-Edit-2509"]
+test_params = models
 
 
 class OmniServer:
@@ -104,12 +101,9 @@ class OmniServer:
 
 @pytest.fixture
 def omni_server(request):
-    """Start vLLM-Omni server as a subprocess with actual model weights.
-    Uses module scope so the server starts only once for all tests.
-    Multi-stage initialization can take 10-20+ minutes.
-    """
-    model, stage_config_path = request.param
-    with OmniServer(model, ["--stage-configs-path", stage_config_path, "--init-sleep-seconds", "90"]) as server:
+    """Start vLLM-Omni server as a subprocess with actual model weights."""
+    model = request.param
+    with OmniServer(model, ["--num-gpus", "1"]) as server:
         yield server
 
 
@@ -123,84 +117,83 @@ def client(omni_server):
 
 
 @pytest.fixture(scope="session")
-def base64_encoded_video() -> str:
-    """Base64 encoded video for testing."""
-    import base64
-
-    video = VideoAsset(name="baby_reading", num_frames=4)
-    with open(video.video_path, "rb") as f:
-        content = f.read()
-        return base64.b64encode(content).decode("utf-8")
-
-
-def get_system_prompt():
-    return {
-        "role": "system",
-        "content": [
-            {
-                "type": "text",
-                "text": (
-                    "You are Qwen, a virtual human developed by the Qwen Team, "
-                    "Alibaba Group, capable of perceiving auditory and visual inputs, "
-                    "as well as generating text and speech."
-                ),
-            }
-        ],
-    }
-
-
-def dummy_messages_from_video_data(
-    video_data_url: str,
-    content_text: str = "Describe the video briefly.",
-):
-    """Create messages with video data URL for OpenAI API."""
-    return [
-        get_system_prompt(),
-        {
-            "role": "user",
-            "content": [
-                {"type": "video_url", "video_url": {"url": video_data_url}},
-                {"type": "text", "text": content_text},
-            ],
-        },
+def base64_encoded_images() -> list[str]:
+    """Base64 encoded PNG images for testing."""
+    images = [
+        ImageAsset("cherry_blossom").pil_image.convert("RGB"),
+        ImageAsset("stop_sign").pil_image.convert("RGB"),
     ]
+    encoded: list[str] = []
+    for img in images:
+        with BytesIO() as buffer:
+            img.save(buffer, format="PNG")
+            encoded.append(base64.b64encode(buffer.getvalue()).decode("utf-8"))
+    return encoded
+
+
+def dummy_messages_from_image_data(
+    image_data_urls: list[str],
+    content_text: str = "Combine these two images into one scene.",
+):
+    """Create messages with image data URLs for OpenAI API."""
+    content = [{"type": "text", "text": content_text}]
+    for image_url in image_data_urls:
+        content.append({"type": "image_url", "image_url": {"url": image_url}})
+    return [{"role": "user", "content": content}]
+
+
+def _extract_image_data_url(message_content) -> str:
+    assert isinstance(message_content, list) and len(message_content) >= 1
+    content_part = message_content[0]
+    if isinstance(content_part, dict):
+        image_url = content_part.get("image_url", {}).get("url", "")
+    else:
+        image_url_obj = getattr(content_part, "image_url", None)
+        if isinstance(image_url_obj, dict):
+            image_url = image_url_obj.get("url", "")
+        else:
+            image_url = getattr(image_url_obj, "url", "")
+    assert isinstance(image_url, str) and image_url
+    return image_url
+
+
+def _decode_data_url_to_image_bytes(data_url: str) -> bytes:
+    assert data_url.startswith("data:image")
+    _, b64_data = data_url.split(",", 1)
+    return base64.b64decode(b64_data)
 
 
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_video_to_audio(
+def test_i2i_multi_image_input_qwen_image_edit_2509(
     client: openai.OpenAI,
     omni_server,
-    base64_encoded_video: str,
+    base64_encoded_images: list[str],
 ) -> None:
-    """Test processing video, generating audio output via OpenAI API."""
-    # Create data URL for the base64 encoded video
-    video_data_url = f"data:video/mp4;base64,{base64_encoded_video}"
+    """Test multi-image input editing via OpenAI API."""
+    image_data_urls = [f"data:image/png;base64,{img}" for img in base64_encoded_images]
+    messages = dummy_messages_from_image_data(image_data_urls)
 
-    messages = dummy_messages_from_video_data(video_data_url)
-
-    # Test single completion
+    height = 832
+    width = 1248
     chat_completion = client.chat.completions.create(
         model=omni_server.model,
         messages=messages,
+        extra_body={
+            "height": height,
+            "width": width,
+            "num_inference_steps": 2,
+            "guidance_scale": 0.0,
+            "seed": 42,
+        },
     )
 
-    assert len(chat_completion.choices) == 2  # 1 for text output, 1 for audio output
+    assert len(chat_completion.choices) == 1
+    choice = chat_completion.choices[0]
+    assert choice.finish_reason == "stop"
+    assert choice.message.role == "assistant"
 
-    # Verify text output
-    text_choice = chat_completion.choices[0]
-    assert text_choice.finish_reason == "length"
-
-    # Verify we got a response
-    text_message = text_choice.message
-    assert text_message.content is not None and len(text_message.content) >= 10
-    assert text_message.role == "assistant"
-
-    # Verify audio output
-    audio_choice = chat_completion.choices[1]
-    assert audio_choice.finish_reason == "stop"
-    audio_message = audio_choice.message
-
-    # Check if audio was generated
-    if hasattr(audio_message, "audio") and audio_message.audio:
-        assert audio_message.audio.data is not None
-        assert len(audio_message.audio.data) > 0
+    image_data_url = _extract_image_data_url(choice.message.content)
+    image_bytes = _decode_data_url_to_image_bytes(image_data_url)
+    img = Image.open(BytesIO(image_bytes))
+    img.load()
+    assert img.size == (width, height)
