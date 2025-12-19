@@ -4,7 +4,7 @@
 Pytest configuration and fixtures for vllm-omni tests.
 """
 
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
@@ -25,6 +25,7 @@ class OmniRunner:
     def __init__(
         self,
         model_name: str,
+        mode: Literal["llm", "diffusion"] = "llm",
         seed: int = 42,
         init_sleep_seconds: int = 20,
         batch_timeout: int = 10,
@@ -51,8 +52,7 @@ class OmniRunner:
         self.model_name = model_name
         self.seed = seed
 
-        self.omni = Omni(
-            model=model_name,
+        llm_kwargs = dict(
             log_stats=log_stats,
             init_sleep_seconds=init_sleep_seconds,
             batch_timeout=batch_timeout,
@@ -60,6 +60,13 @@ class OmniRunner:
             shm_threshold_bytes=shm_threshold_bytes,
             stage_configs_path=stage_configs_path,
             **kwargs,
+        )
+        od_kwargs = dict(**kwargs)
+        init_kwargs = llm_kwargs if mode == "llm" else od_kwargs
+
+        self.omni = Omni(
+            model=model_name,
+            **init_kwargs,
         )
 
     def get_default_sampling_params_list(self) -> list[SamplingParams]:
@@ -206,6 +213,23 @@ class OmniRunner:
             sampling_params_list = self.get_default_sampling_params_list()
 
         return self.omni.generate(prompts, sampling_params_list)
+
+    def generate_diffusion(
+        self,
+        prompt: str | list[str],
+        **kwargs,
+    ) -> list[Any]:
+        """
+        Convenience method to generate with diffusion models.
+
+        Args:
+            prompt: Text prompt(s)
+            **kwargs: Additional generation parameters
+
+        Returns:
+            List of generated images
+        """
+        return self.omni.generate(prompt, **kwargs)
 
     def generate_multimodal(
         self,
