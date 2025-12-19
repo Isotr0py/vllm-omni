@@ -15,6 +15,8 @@ from pathlib import Path
 import pytest
 import torch
 
+from utils import create_new_process_for_each_test
+
 # ruff: noqa: E402
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -29,6 +31,7 @@ models = ["riverclouds/qwen_image_random"]
 
 
 @pytest.mark.parametrize("model_name", models)
+@create_new_process_for_each_test()
 def test_teacache(model_name: str):
     """Test TeaCache backend with diffusion model."""
     # Configure TeaCache with default settings for fast testing

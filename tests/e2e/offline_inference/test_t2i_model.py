@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from vllm_omni.utils.platform_utils import is_npu
+from utils import create_new_process_for_each_test
 
 # ruff: noqa: E402
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -27,6 +28,7 @@ if is_npu():
 
 
 @pytest.mark.parametrize("model_name", models)
+@create_new_process_for_each_test()
 def test_diffusion_model(model_name: str):
     m = Omni(model=model_name)
     # high resolution may cause OOM on L4

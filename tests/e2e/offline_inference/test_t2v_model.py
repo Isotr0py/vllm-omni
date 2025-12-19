@@ -5,6 +5,8 @@ from pathlib import Path
 import pytest
 import torch
 
+from utils import create_new_process_for_each_test
+
 # ruff: noqa: E402
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -18,6 +20,7 @@ models = ["Wan-AI/Wan2.2-T2V-A14B-Diffusers"]
 
 
 @pytest.mark.parametrize("model_name", models)
+@create_new_process_for_each_test()
 def test_video_diffusion_model(model_name: str):
     m = Omni(
         model=model_name,
