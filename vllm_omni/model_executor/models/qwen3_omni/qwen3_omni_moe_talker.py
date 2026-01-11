@@ -196,6 +196,7 @@ class Qwen3OmniMoeTalkerSparseFusedMoeBlock(nn.Module):
             enable_eplb=self.enable_eplb,
             num_redundant_experts=self.n_redundant_experts,
             is_sequence_parallel=self.is_sequence_parallel,
+            routing_method_type=RoutingMethodType.Renormalize,
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
