@@ -15,12 +15,12 @@ from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeAudioEncoder,
 )
-from vllm.config import VllmConfig
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.distributed import get_tensor_model_parallel_world_size, get_ep_group, tensor_model_parallel_all_gather
 from vllm.logger import init_logger
-from vllm.model_executor.layers.activation import _ACTIVATION_REGISTRY
+from vllm.model_executor.layers.activation import _ACTIVATION_REGISTRY, SiluAndMul
 from vllm.model_executor.layers.fused_moe import SharedFusedMoE
-from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.model_executor.layers.linear import ReplicatedLinear, MergedColumnParallelLinear, RowParallelLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
@@ -32,10 +32,12 @@ from vllm.model_executor.models.qwen2_5_omni_thinker import (
 )
 from vllm.model_executor.models.qwen3_moe import Qwen3MoeMLP, Qwen3MoeSparseMoeBlock
 from vllm.model_executor.models.qwen3_omni_moe_thinker import Qwen3Omni_VisionTransformer
+from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     WeightsMapper,
     maybe_prefix,
+    sequence_parallel_chunk,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
@@ -59,6 +61,176 @@ except (ImportError, ModuleNotFoundError):
 logger = init_logger(__name__)
 
 Qwen3OmniMoeThinkerDummyInputsBuilder = Qwen2_5OmniThinkerDummyInputsBuilder
+
+
+class Qwen3MoeTalkerMLP(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        hidden_act: str,
+        quant_config: QuantizationConfig | None = None,
+        reduce_results: bool = True,
+        expert_gate: torch.nn.Linear | None = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        self.gate_up_proj = MergedColumnParallelLinear(
+            hidden_size,
+            [intermediate_size] * 2,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.gate_up_proj",
+        )
+        self.down_proj = RowParallelLinear(
+            intermediate_size,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            reduce_results=reduce_results,
+            prefix=f"{prefix}.down_proj",
+        )
+        if hidden_act != "silu":
+            raise ValueError(
+                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
+            )
+        self.act_fn = SiluAndMul()
+        self.expert_gate = expert_gate
+
+    def forward(self, x):
+        gate_up, _ = self.gate_up_proj(x)
+        out = self.act_fn(gate_up)
+        out, _ = self.down_proj(out)
+
+        if self.expert_gate is not None:
+            out = F.sigmoid(self.expert_gate(x)[0]) * out
+
+        return out
+
+
+class Qwen3OmniMoeTalkerSparseFusedMoeBlock(nn.Module):
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        prefix: str = "",
+    ):
+        super().__init__()
+
+        config = vllm_config.model_config.hf_text_config
+        parallel_config = vllm_config.parallel_config
+        quant_config = vllm_config.quant_config
+
+        self.tp_size = get_tensor_model_parallel_world_size()
+
+        self.ep_group = get_ep_group().device_group
+        self.ep_rank = get_ep_group().rank_in_group
+        self.ep_size = self.ep_group.size()
+        self.n_routed_experts = config.num_experts
+
+        self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
+
+        if self.tp_size > config.num_experts:
+            raise ValueError(
+                f"Tensor parallel size {self.tp_size} is greater than "
+                f"the number of experts {config.num_experts}."
+            )
+
+        # Load balancing settings.
+        vllm_config = get_current_vllm_config()
+        eplb_config = vllm_config.parallel_config.eplb_config
+        self.enable_eplb = parallel_config.enable_eplb
+
+        self.n_logical_experts = self.n_routed_experts
+        self.n_redundant_experts = eplb_config.num_redundant_experts
+        self.n_physical_experts = self.n_logical_experts + self.n_redundant_experts
+        self.n_local_physical_experts = self.n_physical_experts // self.ep_size
+
+        self.physical_expert_start = self.ep_rank * self.n_local_physical_experts
+        self.physical_expert_end = (
+            self.physical_expert_start + self.n_local_physical_experts
+        )
+
+        self.gate = ReplicatedLinear(
+            config.hidden_size,
+            config.num_experts,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.gate",
+        )
+
+        shared_expert_intermediate_size = getattr(
+            config, "shared_expert_intermediate_size", 0
+        )
+        if shared_expert_intermediate_size > 0:
+            self.shared_expert_gate = ReplicatedLinear(
+                config.hidden_size,
+                1,
+                bias=False,
+                quant_config=None,
+                prefix=f"{prefix}.shared_expert_gate",
+            )
+            self.shared_expert = Qwen3MoeTalkerMLP(
+                hidden_size=config.hidden_size,
+                intermediate_size=shared_expert_intermediate_size,
+                hidden_act=config.hidden_act,
+                quant_config=quant_config,
+                reduce_results=False,
+                expert_gate=self.shared_expert_gate,
+                prefix=f"{prefix}.shared_expert",
+            )
+        else:
+            self.shared_expert_gate = None
+            self.shared_expert = None
+
+        self.experts = self.experts = SharedFusedMoE(
+            shared_experts=self.shared_expert,
+            gate=self.gate,
+            num_experts=self.n_routed_experts,
+            top_k=config.num_experts_per_tok,
+            hidden_size=config.hidden_size,
+            intermediate_size=config.moe_intermediate_size,
+            reduce_results=False,
+            renormalize=config.norm_topk_prob,
+            quant_config=quant_config,
+            prefix=f"{prefix}.experts",
+            enable_eplb=self.enable_eplb,
+            num_redundant_experts=self.n_redundant_experts,
+            is_sequence_parallel=self.is_sequence_parallel,
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        assert hidden_states.dim() <= 2, (
+            "Qwen3MoeSparseMoeBlock only supports 1D or 2D inputs"
+        )
+        is_input_1d = hidden_states.dim() == 1
+        num_tokens, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_dim)
+
+        if self.is_sequence_parallel:
+            hidden_states = sequence_parallel_chunk(hidden_states)
+
+        # router_logits: (num_tokens, n_experts)
+        router_logits, _ = self.gate(hidden_states)
+        shared_out, fused_out = self.experts(
+            hidden_states=hidden_states, router_logits=router_logits
+        )
+
+        final_hidden_states = (
+            shared_out + fused_out if self.shared_expert is not None else fused_out
+        )
+
+        if self.is_sequence_parallel:
+            final_hidden_states = tensor_model_parallel_all_gather(
+                final_hidden_states, 0
+            )
+            final_hidden_states = final_hidden_states[:num_tokens]
+        elif self.tp_size > 1:
+            final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(  # noqa E501
+                final_hidden_states
+            )
+
+        # return to 1d if input is 1d
+        return final_hidden_states.squeeze(0) if is_input_1d else final_hidden_states
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -716,9 +888,13 @@ class Qwen3OmniMoeModel(Qwen3MoeLLMForCausalLM):
                     del compilation_config.static_forward_context[old_experts_prefix]
 
                 # Create new MoE block with shared expert support
-                layer.mlp = Qwen3OmniMoeTalkerSparseMoeBlock(
-                    config=self.config,
-                    quant_config=self.talker_vllm_config.quant_config,
+                # layer.mlp = Qwen3OmniMoeTalkerSparseMoeBlock(
+                #     config=self.config,
+                #     quant_config=self.talker_vllm_config.quant_config,
+                #     prefix=f"{prefix}.model.layers.{layer_idx}.mlp",
+                # )
+                layer.mlp = Qwen3OmniMoeTalkerSparseFusedMoeBlock(
+                    vllm_config=self.talker_vllm_config,
                     prefix=f"{prefix}.model.layers.{layer_idx}.mlp",
                 )
 
