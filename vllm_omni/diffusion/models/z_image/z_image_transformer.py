@@ -29,6 +29,7 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
+    ReplicatedLinear,
     RowParallelLinear,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
@@ -212,16 +213,18 @@ class TimestepEmbedder(nn.Module):
         if mid_size is None:
             mid_size = out_size
         self.mlp = nn.Sequential(
-            nn.Linear(
+            ReplicatedLinear(
                 frequency_embedding_size,
                 mid_size,
                 bias=True,
+                return_bias=False,
             ),
             nn.SiLU(),
-            nn.Linear(
+            ReplicatedLinear(
                 mid_size,
                 out_size,
                 bias=True,
+                return_bias=False,
             ),
         )
 
@@ -420,7 +423,7 @@ class ZImageTransformerBlock(nn.Module):
         self.modulation = modulation
         if modulation:
             self.adaLN_modulation = nn.Sequential(
-                nn.Linear(min(dim, ADALN_EMBED_DIM), 4 * dim, bias=True),
+                ReplicatedLinear(min(dim, ADALN_EMBED_DIM), 4 * dim, bias=True, return_bias=False),
             )
 
     def forward(
@@ -476,11 +479,11 @@ class FinalLayer(nn.Module):
     def __init__(self, hidden_size, out_channels):
         super().__init__()
         self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.linear = nn.Linear(hidden_size, out_channels, bias=True)
+        self.linear = ReplicatedLinear(hidden_size, out_channels, bias=True)
 
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(min(hidden_size, ADALN_EMBED_DIM), hidden_size, bias=True),
+            ReplicatedLinear(min(hidden_size, ADALN_EMBED_DIM), hidden_size, bias=True, return_bias=False),
         )
 
     def forward(self, x, c):
@@ -652,7 +655,12 @@ class ZImageTransformer2DModel(CachedTransformer):
         all_x_embedder = {}
         all_final_layer = {}
         for patch_idx, (patch_size, f_patch_size) in enumerate(zip(all_patch_size, all_f_patch_size)):
-            x_embedder = nn.Linear(f_patch_size * patch_size * patch_size * in_channels, dim, bias=True)
+            x_embedder = ReplicatedLinear(
+                f_patch_size * patch_size * patch_size * in_channels,
+                dim,
+                bias=True,
+                return_bias=False,
+            )
             all_x_embedder[f"{patch_size}-{f_patch_size}"] = x_embedder
 
             final_layer = FinalLayer(dim, patch_size * patch_size * f_patch_size * self.out_channels)
@@ -693,7 +701,7 @@ class ZImageTransformer2DModel(CachedTransformer):
         self.t_embedder = TimestepEmbedder(min(dim, ADALN_EMBED_DIM), mid_size=1024)
         self.cap_embedder = nn.Sequential(
             RMSNorm(cap_feat_dim, eps=norm_eps),
-            nn.Linear(cap_feat_dim, dim, bias=True),
+            ReplicatedLinear(cap_feat_dim, dim, bias=True, return_bias=False),
         )
 
         self.x_pad_token = nn.Parameter(torch.empty((1, dim)))
