@@ -1,0 +1,28 @@
+[package]
+name = "vllm-omni-rs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+libc.workspace = true
+thiserror.workspace = true
+thiserror-ext.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+vllm-chat.workspace = true
+vllm-engine-core-client.workspace = true
+vllm-server.workspace = true
+vllm-tracing.workspace = true
+
+[dev-dependencies]
+futures.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+zeromq.workspace = true
+
+[lints]
+workspace = true
