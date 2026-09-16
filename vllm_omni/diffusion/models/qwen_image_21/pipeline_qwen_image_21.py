@@ -1225,16 +1225,18 @@ class QwenImage21Pipeline(
             return [{} for _ in range(num_blocks)], True
         if phases == {"decode"}:
             # Decode only reads the cache, so a batched view is enough and the
-            # per-request caches stay untouched.
+            # per-request caches stay untouched. Merge every stored part — FP8
+            # cache entries carry per-request scale tensors alongside "key"/"value".
             num_blocks = len(caches[0])
             merged = []
             for block_idx in range(num_blocks):
                 branches: dict[str, dict[str, torch.Tensor]] = {}
                 branch_names = {branch for cache in caches for branch in cache[block_idx]}
                 for branch in branch_names:
+                    part_names = {part for cache in caches for part in cache[block_idx][branch]}
                     branches[branch] = {
                         part: torch.cat([cache[block_idx][branch][part] for cache in caches], dim=0)
-                        for part in ("key", "value")
+                        for part in sorted(part_names)
                     }
                 merged.append(branches)
             return merged, False

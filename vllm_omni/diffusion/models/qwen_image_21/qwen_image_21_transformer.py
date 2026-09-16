@@ -40,6 +40,38 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+_FP8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
+
+# Accepted values for the `prefix_kv_cache_dtype` switch (see QwenImage21Transformer2DModel).
+_PREFIX_KV_FP8_ALIASES = {"fp8", "fp8_e4m3", "fp8_e4m3fn"}
+
+
+def _quantize_prefix_kv_fp8(t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-token-per-head symmetric FP8 E4M3 quantization of a (B, S, H, D) K/V tensor.
+
+    One fp32 scale per (batch, token, head): it tracks the heavy-tailed per-token magnitude of
+    post-RoPE keys and outlier-channel values far better than a per-tensor scale, and the scale
+    tensor stays mergeable across the batch dim for batched decode (`_assemble_kv_cache`).
+    """
+    scale = t.abs().amax(dim=-1, keepdim=True).float().clamp_min(1e-12) / _FP8_E4M3_MAX
+    quantized = (t / scale).clamp(-_FP8_E4M3_MAX, _FP8_E4M3_MAX).to(torch.float8_e4m3fn)
+    return quantized, scale
+
+
+def _dequantize_prefix_kv_fp8(quantized: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    return (quantized.float() * scale).to(dtype)
+
+
+def _normalize_prefix_kv_cache_dtype(value: Any) -> str | None:
+    """Normalize the `prefix_kv_cache_dtype` switch: None/"auto" = off, "fp8*" = FP8 E4M3 storage."""
+    if value is None or value == "auto":
+        return None
+    if value in _PREFIX_KV_FP8_ALIASES:
+        return "fp8_e4m3"
+    raise ValueError(
+        f"Unknown prefix_kv_cache_dtype {value!r}; expected None, 'auto' or one of {sorted(_PREFIX_KV_FP8_ALIASES)}."
+    )
+
 
 def _apply_qwen_image21_rotary_emb(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
     """Rotate interleaved pairs with complex FP32 multiplication.
@@ -390,9 +422,11 @@ class QwenImage21Attention(nn.Module):
         eps: float = 1e-6,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        prefix_kv_cache_dtype: str | None = None,
     ):
         super().__init__()
         self.head_dim = dim_head
+        self.prefix_kv_cache_dtype = prefix_kv_cache_dtype
 
         self.to_qkv = QKVParallelLinear(
             hidden_size=dim,
@@ -460,7 +494,8 @@ class QwenImage21Attention(nn.Module):
             sp_decode (`bool`): KV-cache decode under sequence parallelism: the cached prefix K/V are replicated
                 and join through the Ulysses joint mechanism with an empty joint query.
             kv_cache (dict, *optional*): Per-block cache keyed by CFG branch (`"cond"` / `"uncond"`); each branch
-                stores `{"key", "value"}` of the timestep-independent prefix (text + condition images).
+                stores `{"key", "value"}` of the timestep-independent prefix (text + condition images). With
+                FP8 cache storage enabled, the branch additionally carries `{"key_scale", "value_scale"}`.
             cache_branch (`str`): CFG branch whose cache entry is read/written this forward.
             cache_write_len (`int`, *optional*): Prefill mode — cache the first `cache_write_len` K/V positions.
                 `None` with a populated branch means decode — cached prefix K/V are prepended instead.
@@ -487,12 +522,28 @@ class QwenImage21Attention(nn.Module):
             branch_cache = kv_cache.setdefault(cache_branch, {})
             if cache_write_len is not None:
                 # Prefill: cache the timestep-independent prefix K/V for later denoising steps.
-                # Own the prefix storage instead of retaining the full prefill tensors.
-                branch_cache["key"] = key[:, :cache_write_len].clone()
-                branch_cache["value"] = value[:, :cache_write_len].clone()
+                if self.prefix_kv_cache_dtype == "fp8_e4m3":
+                    # FP8 storage: quantize once at prefill; decode dequantizes per step.
+                    # The fp32 scales ride along as extra branch entries so the pipeline's
+                    # batched decode merge can concatenate them like the K/V tensors. The
+                    # quantized tensors own their storage, so no clone is needed here.
+                    prefix_key, branch_cache["key_scale"] = _quantize_prefix_kv_fp8(key[:, :cache_write_len])
+                    prefix_value, branch_cache["value_scale"] = _quantize_prefix_kv_fp8(value[:, :cache_write_len])
+                    branch_cache["key"] = prefix_key
+                    branch_cache["value"] = prefix_value
+                else:
+                    # Own the prefix storage instead of retaining the full prefill tensors.
+                    branch_cache["key"] = key[:, :cache_write_len].clone()
+                    branch_cache["value"] = value[:, :cache_write_len].clone()
             else:
                 cached_key = branch_cache["key"]
                 cached_value = branch_cache["value"]
+                if self.prefix_kv_cache_dtype == "fp8_e4m3":
+                    # Dequantize only entries that were actually quantized (scale present).
+                    if "key_scale" in branch_cache:
+                        cached_key = _dequantize_prefix_kv_fp8(cached_key, branch_cache["key_scale"], key.dtype)
+                    if "value_scale" in branch_cache:
+                        cached_value = _dequantize_prefix_kv_fp8(cached_value, branch_cache["value_scale"], value.dtype)
 
         metadata = copy.copy(attn_metadata) if attn_metadata is not None else None
         if sp_prefix_len > 0:
@@ -545,6 +596,7 @@ class QwenImage21TransformerBlock(nn.Module):
         eps: float = 1e-6,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        prefix_kv_cache_dtype: str | None = None,
     ):
         super().__init__()
         self.img_norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
@@ -555,6 +607,7 @@ class QwenImage21TransformerBlock(nn.Module):
             eps=eps,
             quant_config=quant_config,
             prefix=f"{prefix}.attn",
+            prefix_kv_cache_dtype=prefix_kv_cache_dtype,
         )
         self.img_norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
         self.img_mlp = QwenImage21SwiGLUFeedForward(
@@ -696,7 +749,8 @@ class QwenImage21Transformer2DModel(CachedTransformer):
       batch is homogeneous and unpadded, or a dense 4D boolean `attn_mask` otherwise.
     - `causal_condition` — text and condition-image tokens are modulated from `t = 0` instead of the sampled
       timestep, which also makes their activations timestep-independent and so cacheable across denoising steps
-      (`kv_cache`).
+      (`kv_cache`). The cached prefix K/V are stored in the running dtype by default, or in FP8 E4M3 (with
+      per-token-per-head fp32 scales) when `od_config.extras["prefix_kv_cache_dtype"]` is `"fp8"`.
     """
 
     # the small and frequently-repeated block(s) of a model
@@ -763,6 +817,14 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         self.quant_config = _enable_pattern_ignored_layers(quant_config)
         quant_config = self.quant_config
 
+        # Storage dtype for the cross-step prefix KV cache, from the supplementary
+        # model-specific config entry `extras["prefix_kv_cache_dtype"]` (None = bf16/fp32
+        # native storage, unchanged behavior; "fp8" = FP8 E4M3 quantized storage, halving
+        # prefix K/V memory). This is independent of `diffusion_kv_cache_dtype`, which
+        # quantizes attention Q/K/V *compute* per forward on supported backends.
+        extras = getattr(od_config, "extras", None) or {}
+        self.prefix_kv_cache_dtype = _normalize_prefix_kv_cache_dtype(extras.get("prefix_kv_cache_dtype"))
+
         self.pos_embed = QwenImage21Rope(theta=10000, axes_dim=list(axes_dims_rope))
         self.time_text_embed = QwenImage21TimestepProjEmbeddings(
             embedding_dim=self.inner_dim, prefix=f"{prefix}.time_text_embed"
@@ -802,6 +864,7 @@ class QwenImage21Transformer2DModel(CachedTransformer):
                     eps=eps,
                     quant_config=quant_config,
                     prefix=f"{prefix}.transformer_blocks.{i}",
+                    prefix_kv_cache_dtype=self.prefix_kv_cache_dtype,
                 )
                 for i in range(num_layers)
             ]
