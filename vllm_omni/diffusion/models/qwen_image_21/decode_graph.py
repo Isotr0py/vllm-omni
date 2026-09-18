@@ -244,6 +244,16 @@ class QwenImage21DecodeGraphManager:
         first = kv_cache[0].get(cache_branch)
         if first is None or "key" not in first:
             return
+        if any(name.endswith("_scale") for name in first):
+            # Quantized (FP8) prefix storage: the static K/V buffers assume a single
+            # dtype and the captured body would not see the dequant scales (a bf16 K +
+            # fp8 V mix would even copy_ fp8 into bf16 buffers, silently dropping the
+            # scales). Keep quantized-cache requests on the eager decode path.
+            logger.warning_once(
+                "Qwen-Image-2.1 CUDA graph decode: quantized prefix KV cache "
+                "(prefix_kv_cache_dtype) is not graph-capturable; falling back to eager decode."
+            )
+            return
         batch_size = first["key"].shape[0]
         key = (
             cache_branch,

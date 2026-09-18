@@ -44,6 +44,8 @@ _FP8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
 
 # Accepted values for the `prefix_kv_cache_dtype` switch (see QwenImage21Transformer2DModel).
 _PREFIX_KV_FP8_ALIASES = {"fp8", "fp8_e4m3", "fp8_e4m3fn"}
+_PREFIX_KV_FP8_V_ALIASES = {"fp8_v", "fp8_e4m3_v"}
+_PREFIX_KV_FP8_V = "fp8_e4m3_v"
 
 
 def _quantize_prefix_kv_fp8(t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -68,8 +70,14 @@ def _normalize_prefix_kv_cache_dtype(value: Any) -> str | None:
         return None
     if value in _PREFIX_KV_FP8_ALIASES:
         return "fp8_e4m3"
+    if value in _PREFIX_KV_FP8_V_ALIASES:
+        # V-only FP8 storage: K stays in the native dtype. Measured nearly lossless on this
+        # model (PSNR 40.9 dB vs bf16 vs 34.9 dB for K+V fp8) — post-RoPE K is the
+        # precision-sensitive half of the cache.
+        return _PREFIX_KV_FP8_V
     raise ValueError(
-        f"Unknown prefix_kv_cache_dtype {value!r}; expected None, 'auto' or one of {sorted(_PREFIX_KV_FP8_ALIASES)}."
+        f"Unknown prefix_kv_cache_dtype {value!r}; expected None, 'auto' or one of "
+        f"{sorted(_PREFIX_KV_FP8_ALIASES | _PREFIX_KV_FP8_V_ALIASES)}."
     )
 
 
@@ -522,14 +530,18 @@ class QwenImage21Attention(nn.Module):
             branch_cache = kv_cache.setdefault(cache_branch, {})
             if cache_write_len is not None:
                 # Prefill: cache the timestep-independent prefix K/V for later denoising steps.
-                if self.prefix_kv_cache_dtype == "fp8_e4m3":
+                if self.prefix_kv_cache_dtype is not None:
                     # FP8 storage: quantize once at prefill; decode dequantizes per step.
                     # The fp32 scales ride along as extra branch entries so the pipeline's
                     # batched decode merge can concatenate them like the K/V tensors. The
                     # quantized tensors own their storage, so no clone is needed here.
-                    prefix_key, branch_cache["key_scale"] = _quantize_prefix_kv_fp8(key[:, :cache_write_len])
+                    if self.prefix_kv_cache_dtype == "fp8_e4m3":
+                        prefix_key, branch_cache["key_scale"] = _quantize_prefix_kv_fp8(key[:, :cache_write_len])
+                        branch_cache["key"] = prefix_key
+                    else:
+                        # V-only FP8 ("fp8_e4m3_v"): K stays in the native dtype.
+                        branch_cache["key"] = key[:, :cache_write_len].clone()
                     prefix_value, branch_cache["value_scale"] = _quantize_prefix_kv_fp8(value[:, :cache_write_len])
-                    branch_cache["key"] = prefix_key
                     branch_cache["value"] = prefix_value
                 else:
                     # Own the prefix storage instead of retaining the full prefill tensors.
@@ -538,7 +550,7 @@ class QwenImage21Attention(nn.Module):
             else:
                 cached_key = branch_cache["key"]
                 cached_value = branch_cache["value"]
-                if self.prefix_kv_cache_dtype == "fp8_e4m3":
+                if self.prefix_kv_cache_dtype is not None:
                     # Dequantize only entries that were actually quantized (scale present).
                     if "key_scale" in branch_cache:
                         cached_key = _dequantize_prefix_kv_fp8(cached_key, branch_cache["key_scale"], key.dtype)
@@ -750,7 +762,8 @@ class QwenImage21Transformer2DModel(CachedTransformer):
     - `causal_condition` — text and condition-image tokens are modulated from `t = 0` instead of the sampled
       timestep, which also makes their activations timestep-independent and so cacheable across denoising steps
       (`kv_cache`). The cached prefix K/V are stored in the running dtype by default, or in FP8 E4M3 (with
-      per-token-per-head fp32 scales) when `od_config.extras["prefix_kv_cache_dtype"]` is `"fp8"`.
+      per-token-per-head fp32 scales) when `od_config.extras["prefix_kv_cache_dtype"]` is `"fp8"` (K and V)
+      or `"fp8_v"` (V only — K stays in the native dtype).
     """
 
     # the small and frequently-repeated block(s) of a model

@@ -273,23 +273,30 @@ extras:
   prefix_kv_cache_dtype: "fp8"
 ```
 
-Accepted values: `"fp8"` / `"fp8_e4m3"` (quantized storage) and `None` /
-`"auto"` (default, native dtype — behavior unchanged). This is independent of
+Accepted values: `"fp8"` / `"fp8_e4m3"` (K and V quantized), `"fp8_v"` (V
+only — K stays in the native dtype), and `None` / `"auto"` (default, native
+dtype — behavior unchanged). This is independent of
 `diffusion_kv_cache_dtype`, which quantizes attention Q/K/V *compute* per
 forward pass on supported backends.
 
-Measured on T2I 1024x1024 (seed 42, 50 steps, true CFG 4.0; both the bf16
-baseline and the fp8 path are bit-exact across reruns): PSNR vs. baseline
-**28.6 dB** — same composition and semantics, with texture-level drift in
-fine detail. The error is inherent e4m3 precision (~2.6% per cached element)
-accumulated coherently over the denoising trajectory; finer scale granularity
+Measured on T2I 1024x1024 (seed 42, 50 steps, true CFG 4.0, PSNR vs. the
+bf16 baseline): **`"fp8"` 34.9 dB**, **`"fp8_v"` 40.9 dB** — same composition
+and semantics, with texture-level drift in fine detail for `"fp8"`, and
+visually indistinguishable output for `"fp8_v"`. The error is dominated by
+K quantization: post-RoPE keys are the precision-sensitive half of the
+cache, so `"fp8_v"` buys back ~6 dB at 75% (instead of 50%) of the original
+cache size. The residual error is inherent e4m3 precision accumulated
+coherently over the denoising trajectory; finer scale granularity
 (per-tensor/per-head/per-token were compared) or Hadamard-rotated V did not
-improve it. Peak memory dropped from 39436 MB to 38618 MB (−2.1%) for this
-short text-only prompt; the saving scales with prefix length — at the limit
+improve it. The saving scales with prefix length — at the limit
 (8192 text tokens + 4 condition images, ~24.6k prefix tokens) the prefix
-cache is ~12.9 GB per CFG branch in bf16 and ~6.6 GB in fp8,
-which is where this option matters. Treat it as an opt-in for memory-bound
-long-prompt / multi-image workloads, not a free lunch.
+cache is ~12.9 GB per CFG branch in bf16, ~6.6 GB in `"fp8"` and ~9.7 GB in
+`"fp8_v"`, which is where this option matters. Treat it as an opt-in for
+memory-bound long-prompt / multi-image workloads, not a free lunch;
+`"fp8_v"` is the better default trade-off when quality matters.
+
+Note: a quantized prefix cache is not CUDA-graph capturable — requests using
+this option stay on the eager decode path (a warning is logged once).
 
 #### Why not the scheduler-managed paged KV (`DiffusionKVCacheMode.PAGED_SCHEDULER`)?
 
