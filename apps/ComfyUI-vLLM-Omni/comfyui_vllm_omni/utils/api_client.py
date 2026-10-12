@@ -95,7 +95,7 @@ class VLLMOmniClient:
         height: int,
         negative_prompt: str | None = None,
         sampling_params: dict | None = None,
-        lora: dict | None = None,
+        lora: dict | list[dict] | None = None,
     ) -> torch.Tensor:
         """Run text-to-image generation via DALLE API"""
         await self._check_model_exist(model)
@@ -165,7 +165,7 @@ class VLLMOmniClient:
         negative_prompt: str | None = None,
         mask: torch.Tensor | None = None,
         sampling_params: dict | None = None,
-        lora: dict | None = None,
+        lora: dict | list[dict] | None = None,
     ) -> torch.Tensor:
         """Run image editing via DALLE API"""
         await self._check_model_exist(model)
@@ -241,7 +241,7 @@ class VLLMOmniClient:
         audio: AudioInput | None = None,
         video: VideoInput | None = None,
         sampling_params: dict | list[dict] | None = None,
-        lora: dict | None = None,
+        lora: dict | list[dict] | None = None,
     ) -> torch.Tensor:
         payload = VLLMOmniClient._prepare_chat_completion_messages(
             model=model,
@@ -283,7 +283,7 @@ class VLLMOmniClient:
         references: dict | None = None,
         sampling_params: dict | None = None,
         model_params: dict | None = None,
-        lora: dict | None = None,
+        lora: dict | list[dict] | None = None,
         latent_edit: dict | None = None,
         spec_model: str | None = None,
         **extra_params,

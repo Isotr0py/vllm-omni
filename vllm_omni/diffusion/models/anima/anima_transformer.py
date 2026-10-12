@@ -11,6 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.embeddings import Timesteps, apply_rotary_emb
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
+from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
@@ -51,7 +52,13 @@ class CosmosPatchEmbed(nn.Module):
     ) -> None:
         super().__init__()
         self.patch_size = patch_size
-        self.proj = nn.Linear(in_channels * patch_size[0] * patch_size[1] * patch_size[2], out_channels, bias=bias)
+        self.proj = ReplicatedLinear(
+            in_channels * patch_size[0] * patch_size[1] * patch_size[2],
+            out_channels,
+            bias=bias,
+            quant_config=None,
+            return_bias=False,
+        )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, num_channels, num_frames, height, width = hidden_states.shape
@@ -73,9 +80,11 @@ class CosmosPatchEmbed(nn.Module):
 class CosmosTimestepEmbedding(nn.Module):
     def __init__(self, in_features: int, out_features: int) -> None:
         super().__init__()
-        self.linear_1 = nn.Linear(in_features, out_features, bias=False)
+        self.linear_1 = ReplicatedLinear(in_features, out_features, bias=False, quant_config=None, return_bias=False)
         self.activation = nn.SiLU()
-        self.linear_2 = nn.Linear(out_features, 3 * out_features, bias=False)
+        self.linear_2 = ReplicatedLinear(
+            out_features, 3 * out_features, bias=False, quant_config=None, return_bias=False
+        )
 
     def forward(self, timesteps: torch.Tensor) -> torch.Tensor:
         emb = self.linear_1(timesteps)
@@ -103,8 +112,10 @@ class CosmosAdaLayerNorm(nn.Module):
         self.embedding_dim = in_features
         self.activation = nn.SiLU()
         self.norm = nn.LayerNorm(in_features, elementwise_affine=False, eps=1e-6)
-        self.linear_1 = nn.Linear(in_features, hidden_features, bias=False)
-        self.linear_2 = nn.Linear(hidden_features, 2 * in_features, bias=False)
+        self.linear_1 = ReplicatedLinear(in_features, hidden_features, bias=False, quant_config=None, return_bias=False)
+        self.linear_2 = ReplicatedLinear(
+            hidden_features, 2 * in_features, bias=False, quant_config=None, return_bias=False
+        )
 
     def forward(
         self,
@@ -134,9 +145,13 @@ class CosmosAdaLayerNormZero(nn.Module):
         self.norm = nn.LayerNorm(in_features, elementwise_affine=False, eps=1e-6)
         self.activation = nn.SiLU()
         self.linear_1 = (
-            nn.Identity() if hidden_features is None else nn.Linear(in_features, hidden_features, bias=False)
+            nn.Identity()
+            if hidden_features is None
+            else ReplicatedLinear(in_features, hidden_features, bias=False, quant_config=None, return_bias=False)
         )
-        self.linear_2 = nn.Linear(hidden_features or in_features, 3 * in_features, bias=False)
+        self.linear_2 = ReplicatedLinear(
+            hidden_features or in_features, 3 * in_features, bias=False, quant_config=None, return_bias=False
+        )
 
     def forward(
         self,
@@ -164,7 +179,7 @@ class CosmosAdaLayerNormZero(nn.Module):
 class CosmosGELU(nn.Module):
     def __init__(self, dim: int, inner_dim: int, bias: bool = False) -> None:
         super().__init__()
-        self.proj = nn.Linear(dim, inner_dim, bias=bias)
+        self.proj = ReplicatedLinear(dim, inner_dim, bias=bias, quant_config=None, return_bias=False)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return F.gelu(self.proj(hidden_states))
@@ -178,7 +193,7 @@ class CosmosFeedForward(nn.Module):
             [
                 CosmosGELU(dim, inner_dim, bias=bias),
                 nn.Identity(),
-                nn.Linear(inner_dim, dim, bias=bias),
+                ReplicatedLinear(inner_dim, dim, bias=bias, quant_config=None, return_bias=False),
             ]
         )
 
@@ -207,12 +222,17 @@ class CosmosAttention(nn.Module):
         self.dim_head = dim_head
         self.out_dim = inner_dim
         self.query_dim = query_dim
-        self.to_q = nn.Linear(query_dim, inner_dim, bias=False)
-        self.to_k = nn.Linear(cross_attention_dim, inner_dim, bias=False)
-        self.to_v = nn.Linear(cross_attention_dim, inner_dim, bias=False)
+        self.to_q = ReplicatedLinear(query_dim, inner_dim, bias=False, quant_config=None, return_bias=False)
+        self.to_k = ReplicatedLinear(cross_attention_dim, inner_dim, bias=False, quant_config=None, return_bias=False)
+        self.to_v = ReplicatedLinear(cross_attention_dim, inner_dim, bias=False, quant_config=None, return_bias=False)
         self.norm_q = nn.RMSNorm(dim_head, eps=1e-6)
         self.norm_k = nn.RMSNorm(dim_head, eps=1e-6)
-        self.to_out = nn.ModuleList([nn.Linear(inner_dim, query_dim, bias=out_bias), nn.Identity()])
+        self.to_out = nn.ModuleList(
+            [
+                ReplicatedLinear(inner_dim, query_dim, bias=out_bias, quant_config=None, return_bias=False),
+                nn.Identity(),
+            ]
+        )
         self.attn = Attention(
             num_heads=heads,
             head_size=dim_head,
@@ -224,9 +244,9 @@ class CosmosAttention(nn.Module):
 
         self.img_context = img_context
         if img_context:
-            self.q_img = nn.Linear(query_dim, inner_dim, bias=False)
-            self.k_img = nn.Linear(query_dim, inner_dim, bias=False)
-            self.v_img = nn.Linear(query_dim, inner_dim, bias=False)
+            self.q_img = ReplicatedLinear(query_dim, inner_dim, bias=False, quant_config=None, return_bias=False)
+            self.k_img = ReplicatedLinear(query_dim, inner_dim, bias=False, quant_config=None, return_bias=False)
+            self.v_img = ReplicatedLinear(query_dim, inner_dim, bias=False, quant_config=None, return_bias=False)
             self.q_img_norm = nn.RMSNorm(dim_head, eps=1e-6)
             self.k_img_norm = nn.RMSNorm(dim_head, eps=1e-6)
             self.img_attn = Attention(
@@ -349,8 +369,16 @@ class CosmosTransformerBlock(nn.Module):
         self.norm3 = CosmosAdaLayerNormZero(in_features=hidden_size, hidden_features=adaln_lora_dim)
         self.ff = CosmosFeedForward(hidden_size, mult=mlp_ratio, bias=out_bias)
 
-        self.before_proj = nn.Linear(hidden_size, hidden_size) if before_proj else None
-        self.after_proj = nn.Linear(hidden_size, hidden_size) if after_proj else None
+        self.before_proj = (
+            ReplicatedLinear(hidden_size, hidden_size, bias=True, quant_config=None, return_bias=False)
+            if before_proj
+            else None
+        )
+        self.after_proj = (
+            ReplicatedLinear(hidden_size, hidden_size, bias=True, quant_config=None, return_bias=False)
+            if after_proj
+            else None
+        )
 
     def forward(
         self,
@@ -563,19 +591,37 @@ class AnimaTransformer3DModel(nn.Module):
             ]
         )
         self.norm_out = CosmosAdaLayerNorm(hidden_size, adaln_lora_dim)
-        self.proj_out = nn.Linear(hidden_size, patch_size[0] * patch_size[1] * patch_size[2] * out_channels, bias=False)
+        self.proj_out = ReplicatedLinear(
+            hidden_size,
+            patch_size[0] * patch_size[1] * patch_size[2] * out_channels,
+            bias=False,
+            quant_config=None,
+            return_bias=False,
+        )
 
         self.crossattn_proj: nn.Module | None = None
         if use_crossattn_projection:
             self.crossattn_proj = nn.Sequential(
-                nn.Linear(crossattn_proj_in_channels, encoder_hidden_states_channels, bias=True),
+                ReplicatedLinear(
+                    crossattn_proj_in_channels,
+                    encoder_hidden_states_channels,
+                    bias=True,
+                    quant_config=None,
+                    return_bias=False,
+                ),
                 nn.GELU(),
             )
 
         self.img_context_proj: nn.Module | None = None
         if img_context_dim_in:
             self.img_context_proj = nn.Sequential(
-                nn.Linear(img_context_dim_in, img_context_dim_out, bias=True),
+                ReplicatedLinear(
+                    img_context_dim_in,
+                    img_context_dim_out,
+                    bias=True,
+                    quant_config=None,
+                    return_bias=False,
+                ),
                 nn.GELU(),
             )
 

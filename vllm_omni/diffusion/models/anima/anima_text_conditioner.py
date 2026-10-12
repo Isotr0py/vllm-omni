@@ -8,6 +8,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
@@ -78,12 +79,12 @@ class AnimaTextConditionerAttention(nn.Module):
 
         self.num_attention_heads = num_attention_heads
         self.attention_head_dim = attention_head_dim
-        self.q_proj = nn.Linear(query_dim, inner_dim, bias=False)
+        self.q_proj = ReplicatedLinear(query_dim, inner_dim, bias=False, quant_config=None, return_bias=False)
         self.q_norm = nn.RMSNorm(attention_head_dim, eps=1e-6)
-        self.k_proj = nn.Linear(context_dim, inner_dim, bias=False)
+        self.k_proj = ReplicatedLinear(context_dim, inner_dim, bias=False, quant_config=None, return_bias=False)
         self.k_norm = nn.RMSNorm(attention_head_dim, eps=1e-6)
-        self.v_proj = nn.Linear(context_dim, inner_dim, bias=False)
-        self.o_proj = nn.Linear(inner_dim, query_dim, bias=False)
+        self.v_proj = ReplicatedLinear(context_dim, inner_dim, bias=False, quant_config=None, return_bias=False)
+        self.o_proj = ReplicatedLinear(inner_dim, query_dim, bias=False, quant_config=None, return_bias=False)
         self.attn = Attention(
             num_heads=num_attention_heads,
             head_size=attention_head_dim,
@@ -166,9 +167,9 @@ class AnimaTextConditionerBlock(nn.Module):
         )
         self.norm_mlp = norm_cls(model_dim, **norm_kwargs)
         self.mlp = nn.Sequential(
-            nn.Linear(model_dim, int(model_dim * mlp_ratio)),
+            ReplicatedLinear(model_dim, int(model_dim * mlp_ratio), bias=True, quant_config=None, return_bias=False),
             nn.GELU(),
-            nn.Linear(int(model_dim * mlp_ratio), model_dim),
+            ReplicatedLinear(int(model_dim * mlp_ratio), model_dim, bias=True, quant_config=None, return_bias=False),
         )
 
     def forward(
@@ -240,7 +241,11 @@ class AnimaTextConditioner(nn.Module):
             extra_config=kwargs,
         )
         self.embed = nn.Embedding(target_vocab_size, target_dim)
-        self.in_proj = nn.Linear(target_dim, model_dim) if model_dim != target_dim else nn.Identity()
+        self.in_proj = (
+            ReplicatedLinear(target_dim, model_dim, bias=True, quant_config=None, return_bias=False)
+            if model_dim != target_dim
+            else nn.Identity()
+        )
         self.rotary_emb = AnimaRotaryEmbedding(model_dim // num_attention_heads)
         self.blocks = nn.ModuleList(
             [
@@ -256,7 +261,7 @@ class AnimaTextConditioner(nn.Module):
                 for i in range(num_layers)
             ]
         )
-        self.out_proj = nn.Linear(model_dim, target_dim)
+        self.out_proj = ReplicatedLinear(model_dim, target_dim, bias=True, quant_config=None, return_bias=False)
         self.norm = nn.RMSNorm(target_dim, eps=1e-6)
         self.gradient_checkpointing = False
 

@@ -147,7 +147,7 @@ from vllm_omni.entrypoints.openai.utils import (
     get_supported_speakers_from_hf_config,
     is_image_generation_stage,
     is_single_stage_diffusion,
-    parse_lora_request,
+    parse_lora_requests,
     resolve_diffusion_od_config,
     validate_requested_speaker,
 )
@@ -3386,13 +3386,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     self._get_diffusion_extra_body_params(),
                     extra_body,
                 )
-                if lora_body and isinstance(lora_body, dict):
+                if lora_body and isinstance(lora_body, (dict, list)):
                     try:
-                        lora_req, lora_scale = parse_lora_request(lora_body)
-                        if lora_req is not None:
-                            default_stage_params.lora_request = lora_req
-                            if lora_scale is not None:
-                                default_stage_params.lora_scale = lora_scale
+                        lora_reqs, lora_scales = parse_lora_requests(lora_body)
+                        if lora_reqs:
+                            default_stage_params.lora_request = lora_reqs
+                            default_stage_params.lora_scale = lora_scales
                     except Exception as e:  # pragma: no cover - safeguard
                         logger.warning("Failed to parse LoRA request: %s", e)
             elif stage_type == "llm" and idx > 0 and is_image_generation_stage(stage_cfg):
@@ -3467,13 +3466,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             strength=extra_body.get("strength"),
         )
 
-        if lora_body and isinstance(lora_body, dict):
+        if lora_body and isinstance(lora_body, (dict, list)):
             try:
-                lora_req, lora_scale = parse_lora_request(lora_body)
-                if lora_req is not None:
-                    gen_params.lora_request = lora_req
-                    if lora_scale is not None:
-                        gen_params.lora_scale = lora_scale
+                lora_reqs, lora_scales = parse_lora_requests(lora_body)
+                if lora_reqs:
+                    gen_params.lora_request = lora_reqs
+                    gen_params.lora_scale = lora_scales
             except Exception as e:  # pragma: no cover - safeguard
                 logger.warning("Failed to parse LoRA request: %s", e)
 
@@ -3870,13 +3868,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 gen_params.resolution = resolution
 
             # Parse per-request LoRA.
-            if lora_body and isinstance(lora_body, dict):
+            if lora_body and isinstance(lora_body, (dict, list)):
                 try:
-                    lora_req, lora_scale = parse_lora_request(lora_body)
-                    if lora_req is not None:
-                        gen_params.lora_request = lora_req
-                        if lora_scale is not None:
-                            gen_params.lora_scale = lora_scale
+                    lora_reqs, lora_scales = parse_lora_requests(lora_body)
+                    if lora_reqs:
+                        gen_params.lora_request = lora_reqs
+                        gen_params.lora_scale = lora_scales
                 except Exception as exc:  # pragma: no cover - safeguard
                     logger.warning("Failed to parse LoRA request: %s", exc)
 

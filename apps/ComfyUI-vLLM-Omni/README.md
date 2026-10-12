@@ -67,7 +67,7 @@ Every node carries the vLLM-Omni mark in its title bar and is tinted by what it 
 | Blue | Generate Image, Generate Video, Multimodality Understanding, TTS, TTS Voice Clone | A generated image, video, audio, or text. These are the only nodes that reach a server. |
 | Amber | AR / Diffusion / Multi-Stage Sampling Params | Sampling parameters that apply to any model |
 | Purple | Qwen TTS Params, Wan Video Params, MiniMax-H3 Video Params | Parameters that only one model family accepts |
-| Red | LoRA, FastH3 Deployment | Which weights the server is expected to have loaded |
+| Red | LoRA, LoRA List, FastH3 Deployment | Which weights the server is expected to have loaded |
 | Teal | Video References, Latent Mask Editing | Reference media |
 
 Recolouring a node by hand (right click -> Colors) overrides its tint, and the choice is kept.
@@ -83,6 +83,9 @@ To build a simple workflow yourself,
     - For multi-stage models, you can connect multiple **AR Sampling Params** and **Diffusion Sampling Params** nodes to a **Multi-Stage Sampling Params List** node, and connect this node to the generation node.
     - For some multi-stage models like BAGEL, [only one stage's sampling parameters are exposed and tunable via vLLM-Omni's online serving API](https://docs.vllm.ai/projects/vllm-omni/en/latest/user_guide/examples/online_serving/bagel/). Thus, these models are treated as single-stage ones. Please check the vLLM-Omni documentation on how to correctly set each model's sampling parameters.
     - For multi-stage models where all stages are either autoregression or diffusion, you can also connect only a single Sampling Params node, indicating that this set of sampling parameters will be used for all stages.
+- If you want to apply LoRA adapters, grab **vLLM-Omni -> LoRA** nodes.
+    - Connect a single **LoRA** node directly to the generation node's `lora` input, or combine up to three **LoRA** nodes with a **LoRA List** node; chain further **LoRA List** nodes into it for more adapters in one request.
+    - Each **LoRA** keeps its own `scale` (from -4.0 to 4.0, matching ComfyUI's native LoraLoader); the server composes all connected adapters into one for the request. A `lora` input fed by a **LoRA List** is sent as a `lora` array, which requires a vLLM-Omni server that accepts stacked LoRA adapters.
 
 ## Screenshots and Examples
 

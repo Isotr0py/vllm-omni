@@ -107,7 +107,7 @@ class VLLMOmniGenerateImage(_VLLMOmniGenerateBase):
         audio: AudioInput | None = None,  # Hidden & unused
         video: VideoInput | None = None,  # Hidden & unused
         sampling_params: dict | list[dict] | None = None,
-        lora: dict | None = None,
+        lora: dict | list[dict] | None = None,
         **kwargs,
     ):
         if kwargs:
@@ -264,7 +264,7 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
         references: dict | None = None,
         sampling_params: dict | list[dict] | None = None,
         model_params: dict | None = None,
-        lora: dict | None = None,
+        lora: dict | list[dict] | None = None,
         fast_h3: dict | None = None,
         latent_edit: dict | None = None,
         **kwargs,
@@ -836,7 +836,7 @@ class VLLMOmniRemoteLoRA:
                 "name": ("STRING", {"default": ""}),
                 "scale": (
                     "FLOAT",
-                    {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.1},
+                    {"default": 1.0, "min": -4.0, "max": 4.0, "step": 0.1},
                 ),
                 "int_id": (
                     "INT",
@@ -871,6 +871,36 @@ class VLLMOmniRemoteLoRA:
             "int_id": int(int_id) if int_id > 0 else None,
         }
         return (lora,)
+
+
+class VLLMOmniRemoteLoRAList:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "lora1": ("REMOTE_LORA",),
+            },
+            "optional": {
+                "lora2": ("REMOTE_LORA",),
+                "lora3": ("REMOTE_LORA",),
+            },
+        }
+
+    RETURN_TYPES = ("REMOTE_LORA",)
+    RETURN_NAMES = ("lora list",)
+    FUNCTION = "aggregate"
+    CATEGORY = "vLLM-Omni"
+
+    def aggregate(self, lora1: dict, lora2: dict | None = None, lora3: dict | None = None):
+        loras = []
+        for lora in (lora1, lora2, lora3):
+            if lora is None:
+                continue
+            if isinstance(lora, list):
+                loras.extend(lora)
+            else:
+                loras.append(lora)
+        return (loras,)
 
 
 class VLLMOmniFastH3Deployment:

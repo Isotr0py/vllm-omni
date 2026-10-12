@@ -42,6 +42,14 @@ validation; unsupported module suffixes may already fail during loading.
 Checkpoint-to-engine name mapping is tracked in [#8001](https://github.com/vllm-project/vllm-omni/issues/8001);
 until it is available, adapter keys must resolve to supported engine modules.
 
+### kohya sd-scripts format (Anima)
+
+Anima pipelines accept safetensors files trained with kohya-ss/sd-scripts
+directly: keys with the `lora_unet_` prefix are mapped onto the Anima
+transformer modules at load time, and each module's `alpha` is folded into its
+up-projection weights. Keys with the `lora_te_*` prefix (text-encoder LoRAs)
+are currently ignored with a warning.
+
 ## Quick Start
 
 ### Offline Inference
@@ -73,6 +81,54 @@ outputs = omni.generate(
     lora_request=lora_request,
     lora_scale=2.0, # optional arg, default 1.0
 )
+```
+
+#### PEFT backend: stacking multiple LoRAs in one request
+
+A single request can activate several LoRA adapters at once, each with its own
+scale. The adapters are composed into a single adapter whose per-layer rank is
+the sum of the individual ranks; the composed adapter is cached and activated
+like any other adapter, and requests with different LoRA combinations (or
+different scales) are scheduled into separate batches.
+
+Constraints:
+
+- The summed rank of the stacked adapters must not exceed **512** per layer.
+  Two or three typical kohya LoRAs (rank 4-64) fit comfortably.
+- Adapters with a scale of approximately 0 are skipped.
+
+Offline: pass a list of `LoRARequest` objects together with a matching list of
+scales:
+
+```python
+outputs = omni.generate(
+    prompt="A piece of cheesecake",
+    lora_request=[lora_request_a, lora_request_b],
+    lora_scale=[0.8, 0.6],
+)
+```
+
+Online: the `lora` request field accepts an array of objects instead of a
+single object (a single object remains valid):
+
+```json
+"lora": [
+  {"name": "style", "local_path": "/path/to/style.safetensors", "scale": 0.8, "int_id": 1},
+  {"name": "character", "local_path": "/path/to/character.safetensors", "scale": 0.6, "int_id": 2}
+]
+```
+
+`int_id` is optional; when omitted it is derived from `local_path`.
+
+To pre-load and stack several adapters at server startup, pass multiple paths
+to `--lora-path` with optional matching `--lora-scale` values:
+
+```bash
+vllm serve circlestone-labs/Anima \
+  --omni \
+  --lora-backend peft \
+  --lora-path /path/to/style.safetensors /path/to/character.safetensors \
+  --lora-scale 0.8 0.6
 ```
 
 #### Distill backend: fuse distilled LoRA at init

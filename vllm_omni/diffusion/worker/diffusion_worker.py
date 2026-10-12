@@ -268,7 +268,7 @@ class DiffusionWorker:
         # Worker-side cache of (lora_request, lora_scale) per scheduled
         # request id. Used by step mode to recover LoRA identity for cached
         # requests, which only carry their request_id in subsequent ticks.
-        self._step_lora_state: dict[str, tuple[LoRARequest | None, float]] = {}
+        self._step_lora_state: dict[str, tuple[LoRARequest | list[LoRARequest] | None, float | list[float]]] = {}
         self._shutdown_complete = False
         self.stage_id = getattr(od_config, "stage_id", 0)
         self.init_device()
@@ -588,9 +588,6 @@ class DiffusionWorker:
             return
 
         lora_path = self.od_config.lora_path
-        if isinstance(lora_path, list) and len(lora_path) == 1:
-            lora_path = lora_path[0]
-
         lora_backend = self.od_config.lora_backend
         if lora_backend == LoRABackend.PEFT:
             self.lora_manager = DiffusionLoRAManager(
@@ -602,6 +599,8 @@ class DiffusionWorker:
                 lora_scale=self.od_config.lora_scale,
             )
         elif lora_backend == LoRABackend.DISTILL:
+            if isinstance(lora_path, list) and len(lora_path) == 1:
+                lora_path = lora_path[0]
             pipeline = self.model_runner.pipeline
             if hasattr(pipeline, "load_lora_weights"):
                 if self.od_config.lora_scale > 1.0:
@@ -690,7 +689,7 @@ class DiffusionWorker:
 
         if self.lora_manager is not None:
             try:
-                self.lora_manager.set_active_adapter(req.sampling_params.lora_request, req.sampling_params.lora_scale)
+                self.lora_manager.set_active_adapters(req.sampling_params.lora_request, req.sampling_params.lora_scale)
             except Exception as exc:
                 if req.sampling_params.lora_request is not None:
                     raise
@@ -723,7 +722,7 @@ class DiffusionWorker:
         if self.lora_manager is not None and scheduler_output.scheduled_new_reqs:
             sp = scheduler_output.scheduled_new_reqs[0].req.sampling_params
             try:
-                self.lora_manager.set_active_adapter(sp.lora_request, sp.lora_scale)
+                self.lora_manager.set_active_adapters(sp.lora_request, sp.lora_scale)
             except Exception as exc:
                 if sp.lora_request is not None:
                     raise
@@ -770,8 +769,8 @@ class DiffusionWorker:
         if self.lora_manager is None:
             return
 
-        lora_request: LoRARequest | None = None
-        lora_scale = 1.0
+        lora_request: LoRARequest | list[LoRARequest] | None = None
+        lora_scale: float | list[float] = 1.0
         for request_id in scheduler_output.scheduled_request_ids:
             entry = self._step_lora_state.get(request_id)
             if entry is not None:
@@ -779,7 +778,7 @@ class DiffusionWorker:
                 break
 
         try:
-            self.lora_manager.set_active_adapter(lora_request, lora_scale)
+            self.lora_manager.set_active_adapters(lora_request, lora_scale)
         except Exception as exc:
             if lora_request is not None:
                 raise

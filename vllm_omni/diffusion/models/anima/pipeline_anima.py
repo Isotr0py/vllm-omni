@@ -7,7 +7,7 @@ import logging
 import os
 from collections.abc import Callable, Iterable
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import torch
@@ -32,6 +32,12 @@ from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offloa
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.utils.size_utils import normalize_min_aligned_size
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+
+if TYPE_CHECKING:
+    from vllm.lora.lora_model import LoRAModel
+    from vllm.lora.peft_helper import PEFTHelper
+
+    from vllm_omni.lora.request import LoRARequest
 
 logger = logging.getLogger(__name__)
 
@@ -330,6 +336,21 @@ class AnimaPipeline(nn.Module, DiffusionPipelineProfilerMixin, ProgressBarMixin)
         self.vae_scale_factor = _anima_vae_scale_factor_from_vae(self.vae)
         self._setup_profiler()
         return loaded
+
+    def _load_diffusion_lora_adapter(
+        self,
+        *,
+        lora_request: "LoRARequest",
+        lora_path: str | Path,
+        dtype: torch.dtype,
+    ) -> "tuple[LoRAModel, PEFTHelper] | None":
+        from vllm_omni.diffusion.models.anima.lora import load_kohya_anima_lora
+
+        return load_kohya_anima_lora(
+            lora_request=lora_request,
+            lora_path=lora_path,
+            dtype=dtype,
+        )
 
     def _setup_profiler(self) -> None:
         if self._profiler_initialized:
