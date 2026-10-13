@@ -847,7 +847,10 @@ class VLLMOmniRemoteLoRA:
                         "tooltip": "0 means it is not set and the server can derive it.",
                     },
                 ),
-            }
+            },
+            "optional": {
+                "lora": ("REMOTE_LORA",),
+            },
         }
 
     RETURN_TYPES = ("REMOTE_LORA",)
@@ -861,46 +864,18 @@ class VLLMOmniRemoteLoRA:
             return "Both local_path and name must be provided."
         return True
 
-    def get_lora(self, local_path: str, name: str, scale: float, int_id: int):
-        local_path = local_path.strip()
-        name = name.strip()
-        lora = {
-            "local_path": local_path or None,
-            "name": name or None,
+    def get_lora(self, local_path: str, name: str, scale: float, int_id: int, lora: dict | list | None = None):
+        entry = {
+            "local_path": local_path.strip() or None,
+            "name": name.strip() or None,
             "scale": float(scale),
             "int_id": int(int_id) if int_id > 0 else None,
         }
-        return (lora,)
-
-
-class VLLMOmniRemoteLoRAList:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "lora1": ("REMOTE_LORA",),
-            },
-            "optional": {
-                "lora2": ("REMOTE_LORA",),
-                "lora3": ("REMOTE_LORA",),
-            },
-        }
-
-    RETURN_TYPES = ("REMOTE_LORA",)
-    RETURN_NAMES = ("lora list",)
-    FUNCTION = "aggregate"
-    CATEGORY = "vLLM-Omni"
-
-    def aggregate(self, lora1: dict, lora2: dict | None = None, lora3: dict | None = None):
-        loras = []
-        for lora in (lora1, lora2, lora3):
-            if lora is None:
-                continue
-            if isinstance(lora, list):
-                loras.extend(lora)
-            else:
-                loras.append(lora)
-        return (loras,)
+        if lora is None:
+            return ([entry],)
+        if isinstance(lora, list):
+            return (lora + [entry],)
+        return ([lora, entry],)
 
 
 class VLLMOmniFastH3Deployment:

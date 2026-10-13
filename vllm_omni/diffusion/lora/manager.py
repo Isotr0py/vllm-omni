@@ -414,20 +414,38 @@ class DiffusionLoRAManager:
         for module_name in sorted(module_names):
             lora_a_parts: list[torch.Tensor] = []
             lora_b_parts: list[torch.Tensor] = []
+            packed_parts: list[tuple[PackedLoRALayerWeights, float]] = []
             for lora_model, scale in specs:
                 weights = lora_model.loras.get(module_name)
                 if weights is None:
                     continue
                 if isinstance(weights, PackedLoRALayerWeights):
-                    raise NotImplementedError(
-                        f"Cannot compose packed LoRA weights for module {module_name}; "
-                        "stacking adapters on packed layers is not supported."
-                    )
+                    packed_parts.append((weights, scale))
+                    continue
                 lora_a_parts.append(weights.lora_a)
                 lora_b_parts.append(weights.lora_b * scale)
-            if not lora_a_parts:
-                continue
-            composed_rank = sum(part.shape[0] for part in lora_a_parts)
+            if packed_parts:
+                if lora_a_parts:
+                    raise ValueError(
+                        f"Cannot compose LoRA weights for module {module_name}: "
+                        "adapters disagree on packed vs non-packed layout."
+                    )
+                composed_weights = self._compose_packed_lora_weights(module_name, packed_parts)
+                composed_rank = composed_weights.rank
+            else:
+                if not lora_a_parts:
+                    continue
+                composed_rank = sum(part.shape[0] for part in lora_a_parts)
+                # scaling=1.0: the per-adapter scale is already folded into B, so
+                # the composed adapter must not be scaled again at bind time.
+                composed_weights = LoRALayerWeights(
+                    module_name=module_name,
+                    rank=composed_rank,
+                    lora_alpha=composed_rank,
+                    lora_a=torch.cat(lora_a_parts, dim=0),
+                    lora_b=torch.cat(lora_b_parts, dim=1),
+                    scaling=1.0,
+                )
             if composed_rank > max_supported_rank:
                 raise ValueError(
                     f"Combined LoRA rank for module {module_name} is {composed_rank}, "
@@ -435,16 +453,7 @@ class DiffusionLoRAManager:
                     "reduce the number of stacked adapters or their ranks."
                 )
             max_composed_rank = max(max_composed_rank, composed_rank)
-            # scaling=1.0: the per-adapter scale is already folded into B, so
-            # the composed adapter must not be scaled again at bind time.
-            composed_loras[module_name] = LoRALayerWeights(
-                module_name=module_name,
-                rank=composed_rank,
-                lora_alpha=composed_rank,
-                lora_a=torch.cat(lora_a_parts, dim=0),
-                lora_b=torch.cat(lora_b_parts, dim=1),
-                scaling=1.0,
-            )
+            composed_loras[module_name] = composed_weights
 
         if not composed_loras:
             raise ValueError("Cannot compose LoRA adapters: none of the adapters cover any module.")
@@ -458,6 +467,55 @@ class DiffusionLoRAManager:
             }
         )
         return composed_model, peft_helper
+
+    @staticmethod
+    def _compose_packed_lora_weights(
+        module_name: str,
+        packed_parts: list[tuple[PackedLoRALayerWeights, float]],
+    ) -> PackedLoRALayerWeights:
+        """Compose packed (fused-projection) LoRA weights shard by shard.
+
+        Every source adapter must cover the same set of packed shards. For
+        each covered shard, the composed adapter concatenates the A matrices
+        along the rank dim and the scale-weighted B matrices along the column
+        dim, matching the non-packed rank-sum composition per shard.
+        """
+        n_shards = len(packed_parts[0][0].lora_a)
+        coverage = tuple(a is not None for a in packed_parts[0][0].lora_a)
+        for weights, _ in packed_parts[1:]:
+            if len(weights.lora_a) != n_shards or tuple(a is not None for a in weights.lora_a) != coverage:
+                raise ValueError(
+                    f"Cannot compose packed LoRA weights for module {module_name}: "
+                    "adapters must cover the same set of packed shards."
+                )
+        composed_lora_a: list[torch.Tensor | None] = []
+        composed_lora_b: list[torch.Tensor | None] = []
+        composed_rank = 0
+        for shard_idx in range(n_shards):
+            if not coverage[shard_idx]:
+                composed_lora_a.append(None)
+                composed_lora_b.append(None)
+                continue
+            shard_a = torch.cat([weights.lora_a[shard_idx] for weights, _ in packed_parts], dim=0)
+            shard_b = torch.cat([weights.lora_b[shard_idx] * scale for weights, scale in packed_parts], dim=1)
+            if composed_rank == 0:
+                composed_rank = shard_a.shape[0]
+            elif shard_a.shape[0] != composed_rank:
+                raise ValueError(
+                    f"Cannot compose packed LoRA weights for module {module_name}: "
+                    f"shard {shard_idx} composes to rank {shard_a.shape[0]}, expected {composed_rank}."
+                )
+            composed_lora_a.append(shard_a)
+            composed_lora_b.append(shard_b)
+        return PackedLoRALayerWeights(
+            module_name=module_name,
+            rank=composed_rank,
+            lora_alphas=[composed_rank if covered else None for covered in coverage],
+            lora_a=composed_lora_a,
+            lora_b=composed_lora_b,
+            # scaling=1.0: per-adapter scales are already folded into B.
+            scaling=[1.0 if covered else None for covered in coverage],
+        )
 
     def _touch_adapter_info(self, adapter_id):
         """Update the current caching ordering info."""

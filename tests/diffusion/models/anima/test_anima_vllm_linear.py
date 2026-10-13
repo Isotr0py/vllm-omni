@@ -4,8 +4,10 @@
 """Anima DiT/text-conditioner use vLLM linear layers.
 
 Diffusion LoRA replacement (``from_layer_diffusion``) only matches vLLM
-``LinearBase`` subclasses, so every Anima projection must be a
-``ReplicatedLinear`` (TP is disabled for Anima) rather than ``nn.Linear``.
+``LinearBase`` subclasses, so every Anima projection must be a vLLM linear
+(``ReplicatedLinear`` for replicated layers, ``ColumnParallelLinear``/
+``RowParallelLinear``/``QKVParallelLinear``/``MergedColumnParallelLinear``
+for the TP-sharded ones) rather than ``nn.Linear``.
 """
 
 from __future__ import annotations
@@ -18,7 +20,14 @@ from vllm.lora.layers import BaseLayerWithLoRA
 from vllm.lora.lora_model import LoRAModel
 from vllm.lora.lora_weights import LoRALayerWeights
 from vllm.lora.peft_helper import PEFTHelper
-from vllm.model_executor.layers.linear import LinearBase, ReplicatedLinear
+from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
+    LinearBase,
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
 
 from vllm_omni.diffusion.attention import selector
 from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend
@@ -80,13 +89,14 @@ def test_anima_transformer_uses_vllm_linear_layers(monkeypatch: pytest.MonkeyPat
     transformer = _build_transformer(monkeypatch)
     block = transformer.transformer_blocks[0]
 
+    # attn1 (self-attn) fuses q/k/v; attn2 (cross-attn) fuses k/v only.
+    assert isinstance(block.attn1.to_qkv, QKVParallelLinear)
+    assert isinstance(block.attn2.to_q, ColumnParallelLinear)
+    assert isinstance(block.attn2.to_kv, MergedColumnParallelLinear)
     for attn in (block.attn1, block.attn2):
-        _assert_replicated_linear(attn.to_q)
-        _assert_replicated_linear(attn.to_k)
-        _assert_replicated_linear(attn.to_v)
-        _assert_replicated_linear(attn.to_out[0])
-    _assert_replicated_linear(block.ff.net[0].proj)
-    _assert_replicated_linear(block.ff.net[2])
+        assert isinstance(attn.to_out[0], RowParallelLinear)
+    assert isinstance(block.ff.net[0].proj, ColumnParallelLinear)
+    assert isinstance(block.ff.net[2], RowParallelLinear)
     for norm in (block.norm1, block.norm2, block.norm3):
         _assert_replicated_linear(norm.linear_1)
         _assert_replicated_linear(norm.linear_2)
@@ -119,13 +129,13 @@ def test_anima_text_conditioner_uses_vllm_linear_layers(monkeypatch: pytest.Monk
 
 
 def test_anima_vllm_linears_match_nn_linear_numerics(monkeypatch: pytest.MonkeyPatch) -> None:
-    """tp=1 ReplicatedLinear must compute exactly F.linear(x, weight, bias)."""
+    """At tp=1 every vLLM linear variant must compute exactly F.linear(x, weight, bias)."""
     torch.manual_seed(0)
     transformer = _build_transformer(monkeypatch)
     conditioner = _build_conditioner(monkeypatch)
 
     for module in list(transformer.modules()) + list(conditioner.modules()):
-        if not isinstance(module, ReplicatedLinear):
+        if not isinstance(module, LinearBase):
             continue
         x = torch.randn(2, 3, module.input_size)
         with torch.inference_mode():
@@ -212,7 +222,7 @@ def test_diffusion_lora_replaces_and_stacks_on_anima_transformer(monkeypatch: py
     b2 = torch.randn(to_q_dim, r2)
     a3 = torch.randn(r1, to_q_dim)
     b3 = torch.randn(to_q_dim, r1)
-    target_to_q = "transformer.transformer_blocks.0.attn1.to_q"
+    target_to_q = "transformer.transformer_blocks.0.attn2.to_q"
     target_to_out = "transformer.transformer_blocks.0.attn1.to_out.0"
 
     models = {
@@ -247,7 +257,7 @@ def test_diffusion_lora_replaces_and_stacks_on_anima_transformer(monkeypatch: py
     manager.set_active_adapters([_lora_request(1), _lora_request(2)], [s1, s2])
 
     block = transformer.transformer_blocks[0]
-    wrapped_q = block.attn1.to_q
+    wrapped_q = block.attn2.to_q
     wrapped_out = block.attn1.to_out[0]
     assert isinstance(wrapped_q, BaseLayerWithLoRA)
     assert isinstance(wrapped_out, BaseLayerWithLoRA)

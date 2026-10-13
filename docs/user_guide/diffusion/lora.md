@@ -50,6 +50,10 @@ transformer modules at load time, and each module's `alpha` is folded into its
 up-projection weights. Keys with the `lora_te_*` prefix (text-encoder LoRAs)
 are currently ignored with a warning.
 
+kohya LoRA loading and multi-LoRA stacking remain compatible when the Anima
+DiT runs under tensor parallelism (`tensor_parallel_size` in {2, 4, 8, 16};
+see the [Anima recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/circlestone-labs/Anima.md)).
+
 ## Quick Start
 
 ### Offline Inference

@@ -23,9 +23,10 @@ and text conditioner into native vLLM-Omni modules. Non-denoiser components
 such as `text_encoder`, `tokenizer`, `t5_tokenizer`, `vae`, and optionally
 `scheduler` must be supplied through a Diffusers-layout components directory.
 
-Native Anima currently supports baseline single-GPU execution. Cache-DiT,
-TeaCache, CPU offload, layer-wise offload, quantization, TP/SP, CFG parallel,
-HSDP, and step execution are not supported by `AnimaPipeline` yet.
+Native Anima supports single-GPU execution and tensor parallelism (TP) on
+the DiT; see [Tensor Parallelism](#tensor-parallelism). Cache-DiT, TeaCache,
+CPU offload, layer-wise offload, quantization, SP, CFG parallel, HSDP, and
+step execution are not supported by `AnimaPipeline` yet.
 
 ## References
 
@@ -120,8 +121,46 @@ Check that `/tmp/anima_output.png` exists and contains a generated image.
   local checkpoint and `--model-class-name AnimaPipeline` are provided.
 - Start with `max-concurrency=1` for correctness and latency validation.
 - Keep requests at the same resolution when comparing runs.
-- Do not enable parallelism, cache acceleration, offload, or quantized
-  checkpoint flags for Anima until support is added to `AnimaPipeline`.
+- Tensor parallelism on the DiT is supported; see
+  [Tensor Parallelism](#tensor-parallelism). Do not enable sequence or CFG
+  parallelism, cache acceleration, offload, or quantized checkpoint flags for
+  Anima until support is added to `AnimaPipeline`.
+
+## Tensor Parallelism
+
+`AnimaPipeline` supports tensor parallelism on the DiT (denoising
+transformer). The Anima transformer has 16 attention heads of dimension 128,
+a model dimension of 2048, and an FFN inner dimension of 8192, so
+`tensor_parallel_size` must divide all of them. Valid values are 2, 4, 8,
+and 16.
+
+Enable TP through `--tensor-parallel-size` (offline example or
+`vllm serve`), through `DiffusionParallelConfig(tensor_parallel_size=...)`
+in Python, or through `parallel_config.tensor_parallel_size` on the stage
+entry of a deploy YAML:
+
+```bash
+python examples/offline_inference/text_to_image/text_to_image.py \
+    --model "$ANIMA_CHECKPOINT" \
+    --model-class-name AnimaPipeline \
+    --custom-pipeline-args "{\"components_path\":\"$ANIMA_COMPONENTS\"}" \
+    --tensor-parallel-size 2 \
+    --prompt "A cinematic close-up of a glass teapot on a wooden table." \
+    --seed 42 \
+    --output /tmp/anima_output.png
+```
+
+Notes on TP scope:
+
+- Attention Q/K/V/output projections and the FFN layers are sharded across
+  ranks. Small layers (patch/time embeddings, adaLN modulation, output
+  projection), the Qwen3 text encoder, the text conditioner, and the VAE
+  are replicated on every rank, so memory savings come mainly from the DiT.
+- TP composes with kohya LoRA loading and multi-LoRA stacking.
+- The img_context branch (image-to-image extension) is not
+  tensor-parallelized and must stay disabled when `tensor_parallel_size > 1`.
+- TeaCache / Cache-DiT, quantization, and CPU / layer-wise offload remain
+  unsupported, with or without TP.
 
 ## Online Serving
 

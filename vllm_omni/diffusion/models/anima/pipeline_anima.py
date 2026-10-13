@@ -169,8 +169,6 @@ class AnimaPipeline(nn.Module, DiffusionPipelineProfilerMixin, ProgressBarMixin)
             raise NotImplementedError("AnimaPipeline does not yet support CFG parallel. Validate native CFG first.")
         if pc.sequence_parallel_size is not None and pc.sequence_parallel_size > 1:
             raise NotImplementedError("AnimaPipeline does not yet support sequence parallelism. Add an _sp_plan first.")
-        if pc.tensor_parallel_size > 1:
-            raise NotImplementedError("AnimaPipeline does not yet support tensor parallelism. Port TP linears first.")
         if pc.use_hsdp:
             raise NotImplementedError("AnimaPipeline does not yet support HSDP. Validate sharding after native load.")
         if self.od_config.cache_backend not in ("none", None):
@@ -250,7 +248,24 @@ class AnimaPipeline(nn.Module, DiffusionPipelineProfilerMixin, ProgressBarMixin)
         del text_conditioner_state_dict
 
         native_transformer = AnimaTransformer3DModel(**cast(dict[str, Any], transformer_config))
-        native_transformer.load_state_dict(transformer_state_dict, strict=True)
+        transformer_params = dict(native_transformer.named_parameters())
+        # TP ranks shard the full checkpoint through the per-parameter
+        # weight_loaders, so strict load_state_dict cannot be used; verify
+        # completeness against named_parameters instead.
+        loaded = native_transformer.load_weights(transformer_state_dict.items())
+        missing = set(transformer_params) - loaded
+        mapped_checkpoint_keys = set()
+        for key in transformer_state_dict:
+            for param_name, weight_name, _shard_id in native_transformer.stacked_params_mapping:
+                if weight_name in key:
+                    key = key.replace(weight_name, param_name)
+                    break
+            mapped_checkpoint_keys.add(key)
+        unexpected = mapped_checkpoint_keys - set(transformer_params)
+        if missing:
+            raise RuntimeError(f"Missing key(s) in Anima transformer checkpoint: {sorted(missing)}")
+        if unexpected:
+            raise RuntimeError(f"Unexpected key(s) in Anima transformer checkpoint: {sorted(unexpected)}")
         native_transformer.to(device=self.device, dtype=self.od_config.dtype)
         del transformer_state_dict
 

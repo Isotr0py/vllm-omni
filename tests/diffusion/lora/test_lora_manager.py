@@ -1344,7 +1344,7 @@ def test_compose_lora_models_rejects_rank_sum_over_limit():
         manager._compose_lora_models(101, [(model1, 1.0), (model2, 1.0)])
 
 
-def test_compose_lora_models_rejects_packed_weights():
+def test_compose_lora_models_rejects_mixed_packed_and_plain_weights():
     from vllm.lora.lora_weights import PackedLoRALayerWeights
 
     manager = DiffusionLoRAManager(
@@ -1364,8 +1364,55 @@ def test_compose_lora_models_rejects_packed_weights():
     model1 = LoRAModel(lora_model_id=1, rank=2, loras={"transformer.to_qkv": packed})
     model2 = _make_lora_model(2, {"transformer.to_qkv": (torch.ones(2, 4), torch.ones(6, 2))})
 
-    with pytest.raises(NotImplementedError, match="packed LoRA"):
+    with pytest.raises(ValueError, match="packed vs non-packed"):
         manager._compose_lora_models(102, [(model1, 1.0), (model2, 1.0)])
+
+
+def test_compose_lora_models_composes_packed_weights():
+    from vllm.lora.lora_weights import PackedLoRALayerWeights
+
+    manager = DiffusionLoRAManager(
+        pipeline=torch.nn.Module(),
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        max_cached_adapters=3,
+    )
+    name = "transformer.to_qkv"
+
+    def _packed(seed: int) -> PackedLoRALayerWeights:
+        gen = torch.Generator().manual_seed(seed)
+        return PackedLoRALayerWeights(
+            module_name=name,
+            rank=2,
+            lora_alphas=[2, 2],
+            lora_a=[torch.randn(2, 4, generator=gen) for _ in range(2)],
+            lora_b=[torch.randn(6, 2, generator=gen) for _ in range(2)],
+            scaling=[1.0, 1.0],
+        )
+
+    w1, w2 = _packed(1), _packed(2)
+    model1 = LoRAModel(lora_model_id=1, rank=2, loras={name: w1})
+    model2 = LoRAModel(lora_model_id=2, rank=2, loras={name: w2})
+
+    composed, _ = manager._compose_lora_models(102, [(model1, 0.5), (model2, 2.0)])
+
+    packed = composed.loras[name]
+    assert isinstance(packed, PackedLoRALayerWeights)
+    assert packed.rank == 4
+    for shard in range(2):
+        torch.testing.assert_close(packed.lora_a[shard], torch.cat([w1.lora_a[shard], w2.lora_a[shard]], dim=0))
+        torch.testing.assert_close(
+            packed.lora_b[shard],
+            torch.cat([w1.lora_b[shard] * 0.5, w2.lora_b[shard] * 2.0], dim=1),
+        )
+
+    # Shard coverage must match across adapters.
+    w2_missing_shard = _packed(3)
+    w2_missing_shard.lora_a[1] = None
+    w2_missing_shard.lora_b[1] = None
+    model3 = LoRAModel(lora_model_id=3, rank=2, loras={name: w2_missing_shard})
+    with pytest.raises(ValueError, match="same set of packed shards"):
+        manager._compose_lora_models(103, [(model1, 1.0), (model3, 1.0)])
 
 
 def test_compose_lora_models_rejects_empty_coverage():

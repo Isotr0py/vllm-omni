@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import math
 from collections.abc import Iterable
 from types import SimpleNamespace
 from typing import Any
@@ -11,7 +12,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.embeddings import Timesteps, apply_rotary_emb
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
-from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
@@ -40,6 +48,65 @@ ANIMA_TRANSFORMER_CONFIG = {
 # tensors to float32 before computing the rotation, and casts back to bfloat16 at the end.
 # Performing the entire computation in bfloat16 accumulates precision errors across the 28
 # transformer blocks, which is heavily amplified by Classifier-Free Guidance (CFG).
+
+
+def _positive_divisors(n: int) -> set[int]:
+    if n <= 0:
+        return set()
+    divs: set[int] = set()
+    for d in range(1, int(math.isqrt(n)) + 1):
+        if n % d == 0:
+            divs.add(d)
+            divs.add(n // d)
+    return divs
+
+
+def _join_prefix(prefix: str, name: str) -> str:
+    return f"{prefix}.{name}" if prefix else name
+
+
+# (param_name, shard_name, shard_id) — checkpoint sublayers packed into fused
+# projections. attn1 (self-attn) fuses q/k/v into to_qkv; attn2 (cross-attn)
+# fuses k/v into to_kv while to_q stays a standalone column-parallel layer.
+_ANIMA_STACKED_PARAMS_MAPPING = [
+    (".attn1.to_qkv.", ".attn1.to_q.", "q"),
+    (".attn1.to_qkv.", ".attn1.to_k.", "k"),
+    (".attn1.to_qkv.", ".attn1.to_v.", "v"),
+    (".attn2.to_kv.", ".attn2.to_k.", 0),
+    (".attn2.to_kv.", ".attn2.to_v.", 1),
+]
+
+
+def validate_anima_tp_constraints(
+    *,
+    num_attention_heads: int,
+    hidden_size: int,
+    ffn_inner_dim: int,
+    tensor_parallel_size: int,
+) -> list[int]:
+    """Validate Anima DiT TP constraints without requiring a distributed context.
+
+    Returns the sorted list of supported tensor-parallel sizes.
+    """
+    tp_size = int(tensor_parallel_size)
+    if tp_size <= 0:
+        raise ValueError(f"tensor_parallel_size must be > 0, got {tp_size}")
+    for name, value in (
+        ("num_attention_heads", num_attention_heads),
+        ("hidden_size", hidden_size),
+        ("ffn_inner_dim", ffn_inner_dim),
+    ):
+        if value % tp_size != 0:
+            supported = sorted(_positive_divisors(value))
+            raise ValueError(
+                f"Anima requires {name} % tensor_parallel_size == 0, but got {name}={value}, tp={tp_size}. "
+                f"Supported tp candidates by {name}: {supported}"
+            )
+    return sorted(
+        _positive_divisors(num_attention_heads)
+        & _positive_divisors(hidden_size)
+        & _positive_divisors(ffn_inner_dim)
+    )
 
 
 class CosmosPatchEmbed(nn.Module):
@@ -177,23 +244,39 @@ class CosmosAdaLayerNormZero(nn.Module):
 
 
 class CosmosGELU(nn.Module):
-    def __init__(self, dim: int, inner_dim: int, bias: bool = False) -> None:
+    def __init__(self, dim: int, inner_dim: int, bias: bool = False, prefix: str = "") -> None:
         super().__init__()
-        self.proj = ReplicatedLinear(dim, inner_dim, bias=bias, quant_config=None, return_bias=False)
+        self.proj = ColumnParallelLinear(
+            dim,
+            inner_dim,
+            bias=bias,
+            gather_output=False,
+            quant_config=None,
+            return_bias=False,
+            prefix=_join_prefix(prefix, "proj"),
+        )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return F.gelu(self.proj(hidden_states))
 
 
 class CosmosFeedForward(nn.Module):
-    def __init__(self, dim: int, mult: float = 4.0, bias: bool = False) -> None:
+    def __init__(self, dim: int, mult: float = 4.0, bias: bool = False, prefix: str = "") -> None:
         super().__init__()
         inner_dim = int(dim * mult)
         self.net = nn.ModuleList(
             [
-                CosmosGELU(dim, inner_dim, bias=bias),
+                CosmosGELU(dim, inner_dim, bias=bias, prefix=_join_prefix(prefix, "net.0")),
                 nn.Identity(),
-                ReplicatedLinear(inner_dim, dim, bias=bias, quant_config=None, return_bias=False),
+                RowParallelLinear(
+                    inner_dim,
+                    dim,
+                    bias=bias,
+                    input_is_parallel=True,
+                    quant_config=None,
+                    return_bias=False,
+                    prefix=_join_prefix(prefix, "net.2"),
+                ),
             ]
         )
 
@@ -216,29 +299,67 @@ class CosmosAttention(nn.Module):
     ) -> None:
         super().__init__()
         inner_dim = heads * dim_head
-        cross_attention_dim = query_dim if cross_attention_dim is None else cross_attention_dim
 
+        tp_size = get_tensor_model_parallel_world_size()
         self.heads = heads
         self.dim_head = dim_head
         self.out_dim = inner_dim
         self.query_dim = query_dim
-        self.to_q = ReplicatedLinear(query_dim, inner_dim, bias=False, quant_config=None, return_bias=False)
-        self.to_k = ReplicatedLinear(cross_attention_dim, inner_dim, bias=False, quant_config=None, return_bias=False)
-        self.to_v = ReplicatedLinear(cross_attention_dim, inner_dim, bias=False, quant_config=None, return_bias=False)
+        self.is_self_attention = cross_attention_dim is None
+        if self.is_self_attention:
+            self.to_qkv = QKVParallelLinear(
+                hidden_size=query_dim,
+                head_size=dim_head,
+                total_num_heads=heads,
+                total_num_kv_heads=heads,
+                bias=False,
+                quant_config=None,
+                return_bias=False,
+                prefix=_join_prefix(prefix, "to_qkv"),
+            )
+            self.heads_local = self.to_qkv.num_heads
+        else:
+            self.heads_local = heads // tp_size
+            self.to_q = ColumnParallelLinear(
+                query_dim,
+                inner_dim,
+                bias=False,
+                gather_output=False,
+                quant_config=None,
+                return_bias=False,
+                prefix=_join_prefix(prefix, "to_q"),
+            )
+            self.to_kv = MergedColumnParallelLinear(
+                cross_attention_dim,
+                [inner_dim, inner_dim],
+                bias=False,
+                gather_output=False,
+                quant_config=None,
+                return_bias=False,
+                prefix=_join_prefix(prefix, "to_kv"),
+            )
         self.norm_q = nn.RMSNorm(dim_head, eps=1e-6)
         self.norm_k = nn.RMSNorm(dim_head, eps=1e-6)
         self.to_out = nn.ModuleList(
             [
-                ReplicatedLinear(inner_dim, query_dim, bias=out_bias, quant_config=None, return_bias=False),
+                RowParallelLinear(
+                    inner_dim,
+                    query_dim,
+                    bias=out_bias,
+                    input_is_parallel=True,
+                    quant_config=None,
+                    return_bias=False,
+                    prefix=_join_prefix(prefix, "to_out.0"),
+                ),
                 nn.Identity(),
             ]
         )
         self.attn = Attention(
-            num_heads=heads,
+            num_heads=self.heads_local,
             head_size=dim_head,
             softmax_scale=1.0 / (dim_head**0.5),
             causal=False,
-            num_kv_heads=heads,
+            num_kv_heads=self.heads_local,
             prefix=prefix,
         )
 
@@ -265,13 +386,26 @@ class CosmosAttention(nn.Module):
         attention_mask: torch.Tensor | None = None,
         image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        encoder_hidden_states = hidden_states if encoder_hidden_states is None else encoder_hidden_states
         batch_size, seq_len, _ = hidden_states.shape
-        encoder_seq_len = encoder_hidden_states.shape[1]
 
-        query = self.to_q(hidden_states).view(batch_size, seq_len, self.heads, self.dim_head)
-        key = self.to_k(encoder_hidden_states).view(batch_size, encoder_seq_len, self.heads, self.dim_head)
-        value = self.to_v(encoder_hidden_states).view(batch_size, encoder_seq_len, self.heads, self.dim_head)
+        if self.is_self_attention:
+            if encoder_hidden_states is not None:
+                raise ValueError("Self-attention does not take encoder_hidden_states.")
+            q_size = self.to_qkv.num_heads * self.dim_head
+            kv_size = self.to_qkv.num_kv_heads * self.dim_head
+            query, key, value = self.to_qkv(hidden_states).split([q_size, kv_size, kv_size], dim=-1)
+            query = query.view(batch_size, seq_len, self.heads_local, self.dim_head)
+            key = key.view(batch_size, seq_len, self.heads_local, self.dim_head)
+            value = value.view(batch_size, seq_len, self.heads_local, self.dim_head)
+        else:
+            if encoder_hidden_states is None:
+                raise ValueError("Cross-attention requires encoder_hidden_states.")
+            encoder_seq_len = encoder_hidden_states.shape[1]
+            kv_size = self.heads_local * self.dim_head
+            query = self.to_q(hidden_states).view(batch_size, seq_len, self.heads_local, self.dim_head)
+            key, value = self.to_kv(encoder_hidden_states).split([kv_size, kv_size], dim=-1)
+            key = key.view(batch_size, encoder_seq_len, self.heads_local, self.dim_head)
+            value = value.view(batch_size, encoder_seq_len, self.heads_local, self.dim_head)
 
         query = self.norm_q(query)
         key = self.norm_k(key)
@@ -367,7 +501,7 @@ class CosmosTransformerBlock(nn.Module):
             prefix=f"{prefix}.attn2" if prefix else "attn2",
         )
         self.norm3 = CosmosAdaLayerNormZero(in_features=hidden_size, hidden_features=adaln_lora_dim)
-        self.ff = CosmosFeedForward(hidden_size, mult=mlp_ratio, bias=out_bias)
+        self.ff = CosmosFeedForward(hidden_size, mult=mlp_ratio, bias=out_bias, prefix=_join_prefix(prefix, "ff"))
 
         self.before_proj = (
             ReplicatedLinear(hidden_size, hidden_size, bias=True, quant_config=None, return_bias=False)
@@ -535,6 +669,14 @@ class AnimaTransformer3DModel(nn.Module):
     ) -> None:
         super().__init__()
         hidden_size = num_attention_heads * attention_head_dim
+        validate_anima_tp_constraints(
+            num_attention_heads=num_attention_heads,
+            hidden_size=hidden_size,
+            ffn_inner_dim=int(hidden_size * mlp_ratio),
+            tensor_parallel_size=get_tensor_model_parallel_world_size(),
+        )
+        # Expose packed shard mappings for LoRA handling of fused projections.
+        self.stacked_params_mapping = _ANIMA_STACKED_PARAMS_MAPPING
         self.config = SimpleNamespace(
             in_channels=in_channels,
             out_channels=out_channels,
@@ -739,13 +881,21 @@ class AnimaTransformer3DModel(nn.Module):
         return Transformer2DModelOutput(sample=hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        params = dict(self.named_parameters())
+        params_dict = dict(self.named_parameters())
         loaded = set()
         for name, tensor in weights:
-            if name not in params:
-                continue
-            param = params[name]
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, tensor)
+            for param_name, weight_name, shard_id in self.stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+                name = name.replace(weight_name, param_name)
+                param = params_dict[name]
+                param.weight_loader(param, tensor, shard_id)
+                break
+            else:
+                if name not in params_dict:
+                    continue
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, tensor)
             loaded.add(name)
         return loaded
