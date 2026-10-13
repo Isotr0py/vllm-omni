@@ -641,7 +641,7 @@ class AnimaPipeline(nn.Module, DiffusionPipelineProfilerMixin, ProgressBarMixin)
                 stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
             )
 
-        latents = latents.to(self.vae.dtype)
+        latents = latents.float()
         latents_mean = (
             torch.tensor(self.vae.config.latents_mean)
             .view(1, self.vae.config.z_dim, 1, 1, 1)
@@ -653,7 +653,8 @@ class AnimaPipeline(nn.Module, DiffusionPipelineProfilerMixin, ProgressBarMixin)
             .to(latents.device, latents.dtype)
         )
         latents = latents * latents_std + latents_mean
-        image = self.vae.decode(latents, return_dict=False)[0][:, :, 0]
+        # ComfyUI parity: denormalize in fp32, cast to the VAE dtype at decode.
+        image = self.vae.decode(latents.to(self.vae.dtype), return_dict=False)[0][:, :, 0]
         return DiffusionOutput(
             output=image,
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
@@ -698,6 +699,10 @@ class AnimaPipeline(nn.Module, DiffusionPipelineProfilerMixin, ProgressBarMixin)
         sigmas = req.sampling_params.sigmas or sigmas
         max_sequence_length = req.sampling_params.max_sequence_length or max_sequence_length
         generator = req.sampling_params.generator or generator
+        if req.sampling_params.seed is not None:
+            # ComfyUI parity: initial noise always comes from a CPU generator,
+            # whose stream differs from a CUDA generator for the same seed.
+            generator = torch.Generator(device="cpu").manual_seed(req.sampling_params.seed)
         if req.sampling_params.guidance_scale_provided:
             guidance_scale = req.sampling_params.guidance_scale
             if req.sampling_params.true_cfg_scale is None:
