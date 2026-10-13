@@ -654,7 +654,11 @@ class AnimaPipeline(nn.Module, DiffusionPipelineProfilerMixin, ProgressBarMixin)
         )
         latents = latents * latents_std + latents_mean
         # ComfyUI parity: denormalize in fp32, cast to the VAE dtype at decode.
-        image = self.vae.decode(latents.to(self.vae.dtype), return_dict=False)[0][:, :, 0]
+        latents = latents.to(self.vae.dtype)
+        if getattr(self.od_config, "vae_use_tiling", False):
+            image = self.vae.tiled_decode(latents, return_dict=False)[0][:, :, 0]
+        else:
+            image = self.vae.decode(latents, return_dict=False)[0][:, :, 0]
         return DiffusionOutput(
             output=image,
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
