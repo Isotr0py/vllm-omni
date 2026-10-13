@@ -21,6 +21,7 @@ from transformers import AutoTokenizer, Qwen3Model, T5TokenizerFast
 from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_qwenimage import DistributedAutoencoderKLQwenImage
+from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import DistributedVaeMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.models.anima.anima_text_conditioner import (
     ANIMA_TEXT_CONDITIONER_CONFIG,
@@ -147,6 +148,9 @@ class AnimaPipeline(nn.Module, DiffusionPipelineProfilerMixin, ProgressBarMixin)
     """
 
     supports_step_execution = False
+    # The VAE is created in load_weights(), after registry.initialize_model();
+    # VAE parallel/tiling settings are applied there instead.
+    _deferred_distributed_vae = True
 
     def __init__(self, *, od_config: OmniDiffusionConfig, device: torch.device | str | None = None) -> None:
         super().__init__()
@@ -351,6 +355,24 @@ class AnimaPipeline(nn.Module, DiffusionPipelineProfilerMixin, ProgressBarMixin)
         self.t5_tokenizer = t5_tokenizer
         self.vae = vae
         self.scheduler = scheduler
+
+        # The VAE is loaded lazily here, after registry.initialize_model() has
+        # run, so its VAE optimization wiring must be applied manually.
+        vae_pp_size = self.od_config.parallel_config.vae_patch_parallel_size
+        vae_mode = self.od_config.parallel_config.vae_parallel_mode
+        if vae_pp_size > 1 and vae_mode != "batch" and not self.od_config.vae_use_tiling:
+            logger.info(
+                "vae_patch_parallel_size=%d requires vae_use_tiling; automatically enabling it.",
+                vae_pp_size,
+            )
+            self.od_config.vae_use_tiling = True
+        if hasattr(self.vae, "use_slicing"):
+            self.vae.use_slicing = self.od_config.vae_use_slicing
+        if hasattr(self.vae, "use_tiling"):
+            self.vae.use_tiling = self.od_config.vae_use_tiling
+        if isinstance(self.vae, DistributedVaeMixin):
+            self.vae.set_parallel_size(vae_pp_size, mode=vae_mode)
+
         self.vae_scale_factor = _anima_vae_scale_factor_from_vae(self.vae)
         self._setup_profiler()
         return loaded

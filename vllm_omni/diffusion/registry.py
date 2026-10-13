@@ -497,7 +497,11 @@ def initialize_model(
             raise ValueError(
                 "VAE batch parallel decode requires DistributedAutoencoderKL or DistributedAutoencoderKLFlux2"
             )
-        if vae_pp_size > 1 and not is_distributed_vae:
+        # Pipelines that load their VAE lazily (after this hook) declare
+        # `_deferred_distributed_vae` and wire the VAE settings themselves in
+        # their own load path.
+        deferred_distributed_vae = getattr(model_class, "_deferred_distributed_vae", False)
+        if vae_pp_size > 1 and not is_distributed_vae and not deferred_distributed_vae:
             logger.warning(
                 "vae_patch_parallel_size=%d is set but VAE patch parallelism is NOT enabled for %s; ignoring.",
                 vae_pp_size,
