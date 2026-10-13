@@ -81,11 +81,9 @@ class VLLMOmniGenerateImage(_VLLMOmniGenerateBase):
                 "height": ("INT", {"default": 512, "min": 64, "max": 2048}),
                 "output_format": (["png", "webp", "jpeg"], {"default": "webp"}),
                 "output_compression": (
-                    "INT",
+                    ["100", "95", "90", "80", "70", "50"],
                     {
-                        "default": 90,
-                        "min": 1,
-                        "max": 100,
+                        "default": "90",
                         "tooltip": "Lossy quality for webp/jpeg; ignored for png.",
                     },
                 ),
@@ -112,7 +110,7 @@ class VLLMOmniGenerateImage(_VLLMOmniGenerateBase):
         width: int,
         height: int,
         output_format: str = "webp",
-        output_compression: int = 90,
+        output_compression: str = "90",
         negative_prompt: str | None = None,
         image: torch.Tensor | None = None,
         mask: torch.Tensor | None = None,
@@ -126,6 +124,7 @@ class VLLMOmniGenerateImage(_VLLMOmniGenerateBase):
             logger.info("Uncaught kwargs: %s", kwargs)
         logger.debug("Got sampling params: %s", sampling_params)
         validate_model_and_sampling_params_types(model, sampling_params)
+        output_compression = int(output_compression)
         if image is None and mask is not None:
             raise ValueError("Mask input provided without an image input.")
 
