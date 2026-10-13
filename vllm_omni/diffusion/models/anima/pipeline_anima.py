@@ -288,9 +288,12 @@ class AnimaPipeline(nn.Module, DiffusionPipelineProfilerMixin, ProgressBarMixin)
             torch_dtype=self.od_config.dtype,
             **self._from_pretrained_kwargs(text_encoder_model, "text_encoder"),
         ).to(self.device)
+        # The Qwen-Image-family VAE decoder overflows in fp16 (inf/NaN -> black
+        # images); keep it in fp32, matching diffusers and ComfyUI behavior.
+        vae_dtype = torch.float32 if self.od_config.dtype == torch.float16 else self.od_config.dtype
         vae = DistributedAutoencoderKLQwenImage.from_pretrained(
             vae_model,
-            torch_dtype=self.od_config.dtype,
+            torch_dtype=vae_dtype,
             **self._from_pretrained_kwargs(vae_model, "vae"),
         ).to(self.device)
         tokenizer = AutoTokenizer.from_pretrained(
