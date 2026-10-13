@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import contextlib
 import math
 from collections.abc import Iterable
 from types import SimpleNamespace
@@ -833,6 +834,13 @@ class AnimaTransformer3DModel(nn.Module):
         else:
             raise ValueError(f"Expected timestep shape [B, 1, T, 1, 1] or [T], got {timestep.shape}.")
 
+        # A pure-fp16 residual stream overflows in the deeper blocks (inf by
+        # ~block 12, then NaN). Keep the residual stream in fp32 and run the
+        # blocks under fp16 autocast so matmuls stay on fp16 tensor cores.
+        fp32_residual = hidden_states.dtype == torch.float16
+        if fp32_residual:
+            hidden_states = hidden_states.float()
+
         text_context, img_context = (
             encoder_hidden_states if isinstance(encoder_hidden_states, tuple) else (encoder_hidden_states, None)
         )
@@ -857,17 +865,25 @@ class AnimaTransformer3DModel(nn.Module):
             }
 
         for block_idx, block in enumerate(self.transformer_blocks):
-            hidden_states = block(
-                hidden_states,
-                processed_encoder_hidden_states,
-                embedded_timestep,
-                temb,
-                image_rotary_emb,
-                extra_pos_emb,
-                attention_mask,
-                controlnet_block_index_map.get(block_idx),
+            ctx = (
+                torch.autocast(hidden_states.device.type, dtype=torch.float16)
+                if fp32_residual
+                else contextlib.nullcontext()
             )
+            with ctx:
+                hidden_states = block(
+                    hidden_states,
+                    processed_encoder_hidden_states,
+                    embedded_timestep,
+                    temb,
+                    image_rotary_emb,
+                    extra_pos_emb,
+                    attention_mask,
+                    controlnet_block_index_map.get(block_idx),
+                )
 
+        if fp32_residual:
+            hidden_states = hidden_states.half()
         hidden_states = self.norm_out(hidden_states, embedded_timestep, temb)
         hidden_states = self.proj_out(hidden_states)
         hidden_states = hidden_states.unflatten(2, (p_h, p_w, p_t, -1))
