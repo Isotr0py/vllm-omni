@@ -79,6 +79,16 @@ class VLLMOmniGenerateImage(_VLLMOmniGenerateBase):
                 "negative_prompt": ("STRING", {"multiline": True, "default": ""}),
                 "width": ("INT", {"default": 512, "min": 64, "max": 2048}),
                 "height": ("INT", {"default": 512, "min": 64, "max": 2048}),
+                "output_format": (["png", "webp", "jpeg"], {"default": "png"}),
+                "output_compression": (
+                    "INT",
+                    {
+                        "default": 90,
+                        "min": 1,
+                        "max": 100,
+                        "tooltip": "Lossy quality for webp/jpeg; ignored for png.",
+                    },
+                ),
             },
             "optional": {
                 "image": ("IMAGE",),
@@ -101,6 +111,8 @@ class VLLMOmniGenerateImage(_VLLMOmniGenerateBase):
         prompt: str,
         width: int,
         height: int,
+        output_format: str = "png",
+        output_compression: int = 90,
         negative_prompt: str | None = None,
         image: torch.Tensor | None = None,
         mask: torch.Tensor | None = None,
@@ -139,6 +151,8 @@ class VLLMOmniGenerateImage(_VLLMOmniGenerateBase):
                     negative_prompt=negative_prompt,
                     sampling_params=sampling_params,
                     lora=lora,
+                    output_format=output_format,
+                    output_compression=output_compression,
                 )
                 return (output,)
             elif image is not None and audio is None and video is None:
@@ -154,6 +168,8 @@ class VLLMOmniGenerateImage(_VLLMOmniGenerateBase):
                     mask=mask,
                     sampling_params=sampling_params,
                     lora=lora,
+                    output_format=output_format,
+                    output_compression=output_compression,
                 )
                 return (output,)
 
