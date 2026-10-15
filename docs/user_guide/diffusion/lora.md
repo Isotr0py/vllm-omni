@@ -54,6 +54,24 @@ kohya LoRA loading and multi-LoRA stacking remain compatible when the Anima
 DiT runs under tensor parallelism (`tensor_parallel_size` in {2, 4, 8, 16};
 see the [Anima recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/circlestone-labs/Anima.md)).
 
+### diffusers/ComfyUI format (Anima)
+
+Anima pipelines also accept diffusers/ComfyUI-format LoRA safetensors whose
+keys keep the original training names under a `diffusion_model.` prefix with
+`lora_A`/`lora_B` suffixes (e.g. the
+[Anima turbo LoRAs](https://huggingface.co/Einhorn/Anima-Preview_8_Step_Turbo_Lora),
+which target the adaLN modulation layers as well). These files carry no
+per-module `alpha`, so no scaling is folded in. Text-conditioner entries
+(`diffusion_model.llm_adapter.*`) and `text_encoders.*` keys are ignored with
+a warning.
+
+A turbo LoRA is a step-distillation adapter, not a style adapter: run it with
+`guidance_scale=1.0` and the matching few-step schedule (8–12 steps). Turbo
+and kohya-style LoRAs can be stacked in the same request, e.g. turbo at scale
+1.0 plus a style LoRA at its usual scale. Keep the rank budget in mind: the
+stacked rank of any single module must stay within the 512 cap, so one
+rank-64 turbo LoRA plus one or two rank-64 style LoRAs is comfortable.
+
 ## Quick Start
 
 ### Offline Inference

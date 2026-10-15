@@ -11,7 +11,7 @@ from safetensors.torch import save_file
 
 from vllm_omni.diffusion.models.anima.lora import (
     kohya_anima_module_to_omni,
-    load_kohya_anima_lora,
+    load_anima_lora,
 )
 from vllm_omni.lora.request import LoRARequest
 
@@ -83,7 +83,7 @@ def test_load_maps_keys_and_folds_alpha(tmp_path):
     path = tmp_path / "anima_kohya.safetensors"
     ups = _write_kohya_lora(path, alpha=2.0)
 
-    loaded = load_kohya_anima_lora(
+    loaded = load_anima_lora(
         lora_request=_request(path),
         lora_path=path,
         dtype=torch.float32,
@@ -105,7 +105,7 @@ def test_load_defaults_missing_alpha_to_no_scaling(tmp_path):
     module = next(iter(_KOHYA_TO_OMNI))
     ups = _write_kohya_lora(path, alpha=2.0, omit_alpha_for=module)
 
-    lora_model, _ = load_kohya_anima_lora(
+    lora_model, _ = load_anima_lora(
         lora_request=_request(path),
         lora_path=path,
         dtype=torch.float32,
@@ -118,7 +118,7 @@ def test_load_treats_zero_alpha_as_no_scaling(tmp_path):
     path = tmp_path / "anima_kohya.safetensors"
     ups = _write_kohya_lora(path, alpha=0.0)
 
-    lora_model, _ = load_kohya_anima_lora(
+    lora_model, _ = load_anima_lora(
         lora_request=_request(path),
         lora_path=path,
         dtype=torch.float32,
@@ -133,14 +133,14 @@ def test_load_ignores_text_encoder_entries(tmp_path, caplog):
     _write_kohya_lora(path, include_text_encoder=True)
 
     with caplog.at_level(logging.WARNING, logger="vllm_omni.diffusion.models.anima.lora"):
-        lora_model, _ = load_kohya_anima_lora(
+        lora_model, _ = load_anima_lora(
             lora_request=_request(path),
             lora_path=path,
             dtype=torch.float32,
         )
 
     assert set(lora_model.loras) == {f"transformer.{omni}" for omni in _KOHYA_TO_OMNI.values()}
-    assert any("lora_te_" in record.message for record in caplog.records)
+    assert any("text-encoder" in record.message for record in caplog.records)
 
 
 def test_load_rejects_mixed_ranks(tmp_path):
@@ -150,7 +150,7 @@ def test_load_rejects_mixed_ranks(tmp_path):
     _write_kohya_lora(path, modules=modules)
 
     with pytest.raises(ValueError, match="rank"):
-        load_kohya_anima_lora(
+        load_anima_lora(
             lora_request=_request(path),
             lora_path=path,
             dtype=torch.float32,
@@ -162,7 +162,7 @@ def test_load_rejects_unsupported_target(tmp_path):
     _write_kohya_lora(path, modules={"t_embedder_1": _RANK})
 
     with pytest.raises(ValueError, match="not a supported Anima module"):
-        load_kohya_anima_lora(
+        load_anima_lora(
             lora_request=_request(path),
             lora_path=path,
             dtype=torch.float32,
@@ -174,7 +174,7 @@ def test_load_rejects_incomplete_pairs(tmp_path):
     save_file({"lora_unet_blocks_1_self_attn_q_proj.lora_down.weight": torch.randn(_RANK, _IN_DIM)}, str(path))
 
     with pytest.raises(ValueError, match="Incomplete kohya Anima LoRA pairs"):
-        load_kohya_anima_lora(
+        load_anima_lora(
             lora_request=_request(path),
             lora_path=path,
             dtype=torch.float32,
@@ -188,7 +188,7 @@ def test_load_returns_none_for_non_kohya_artifacts(tmp_path):
         str(diffusers_path),
     )
     assert (
-        load_kohya_anima_lora(
+        load_anima_lora(
             lora_request=_request(diffusers_path),
             lora_path=diffusers_path,
             dtype=torch.float32,
@@ -204,7 +204,7 @@ def test_load_returns_none_for_non_kohya_artifacts(tmp_path):
         str(peft_dir / "adapter_model.safetensors"),
     )
     assert (
-        load_kohya_anima_lora(
+        load_anima_lora(
             lora_request=_request(peft_dir),
             lora_path=peft_dir,
             dtype=torch.float32,
@@ -213,7 +213,7 @@ def test_load_returns_none_for_non_kohya_artifacts(tmp_path):
     )
 
     assert (
-        load_kohya_anima_lora(
+        load_anima_lora(
             lora_request=_request(tmp_path / "missing.safetensors"),
             lora_path=tmp_path / "missing.safetensors",
             dtype=torch.float32,

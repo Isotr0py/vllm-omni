@@ -384,9 +384,9 @@ class AnimaPipeline(nn.Module, DiffusionPipelineProfilerMixin, ProgressBarMixin)
         lora_path: str | Path,
         dtype: torch.dtype,
     ) -> "tuple[LoRAModel, PEFTHelper] | None":
-        from vllm_omni.diffusion.models.anima.lora import load_kohya_anima_lora
+        from vllm_omni.diffusion.models.anima.lora import load_anima_lora
 
-        return load_kohya_anima_lora(
+        return load_anima_lora(
             lora_request=lora_request,
             lora_path=lora_path,
             dtype=dtype,
