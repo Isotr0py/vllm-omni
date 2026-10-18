@@ -893,6 +893,46 @@ class VLLMOmniRemoteLoRA:
         return ([lora, entry],)
 
 
+class VLLMOmniTurboLoRASwitch:
+    """One-switch turbo mode: emits turbo sampling params and the turbo LoRA scale.
+
+    Wire the `sampling params` output into the generation node's sampling_params
+    input, and `turbo lora scale` into the turbo LoRA node's `scale` widget
+    (right-click the widget -> convert to input). Enabled: the node's own
+    `steps`/`cfg` widgets (8 / 1 by default) and the turbo LoRA engaged;
+    disabled: base sampling params pass through and the turbo LoRA drops out
+    of the composition (scale 0).
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "enabled": ("BOOLEAN", {"default": False}),
+                "steps": ("INT", {"default": 8, "min": 1, "max": 100}),
+                "cfg": ("FLOAT", {"default": 1.0, "min": 1.0, "max": 20.0, "step": 0.5}),
+            },
+            "optional": {
+                "sampling_params": ("SAMPLING_PARAMS",),
+            },
+        }
+
+    RETURN_TYPES = ("SAMPLING_PARAMS", "FLOAT")
+    RETURN_NAMES = ("sampling params", "turbo lora scale")
+    FUNCTION = "switch"
+    CATEGORY = "vLLM-Omni"
+
+    def switch(self, enabled: bool, steps: int, cfg: float, sampling_params: dict | list[dict] | None = None):
+        if not enabled:
+            return (sampling_params, 0.0)
+        turbo = {"num_inference_steps": int(steps), "guidance_scale": float(cfg), "true_cfg_scale": float(cfg)}
+        if isinstance(sampling_params, list):
+            params = [{**p, **turbo} for p in sampling_params]
+        else:
+            params = {**(sampling_params or {}), **turbo}
+        return (params, 1.0)
+
+
 class VLLMOmniFastH3Deployment:
     """Select a vLLM-Omni service that fused FastH3 at startup."""
 

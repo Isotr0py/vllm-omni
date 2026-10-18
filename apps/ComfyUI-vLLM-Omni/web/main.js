@@ -13,7 +13,9 @@
  * existing types.
  *
  * It also migrates Generate Video graphs saved before `duration` replaced the
- * `num_frames` widget. See migrateNumFramesToDuration below.
+ * `num_frames` widget. See migrateNumFramesToDuration below. And it re-aligns
+ * widget values by name for graphs whose positional `widgets_values` went stale
+ * (saved against a different widget layout). See restoreWidgetsByName below.
  *
  * And it upgrades the `model` field of every node that talks to a server into a
  * dropdown fed with the server's model list. See setupModelCombo below.
@@ -244,6 +246,33 @@ function migrateNumFramesToDuration(node, info) {
     duration.value = seconds;
 }
 
+/**
+ * Re-align widget values of graphs saved against a different widget layout.
+ *
+ * ComfyUI restores `widgets_values` positionally, so a graph saved while a node
+ * had one widget more or fewer comes back with every value shifted onto the
+ * wrong field (prompt text landing in width, etc.). The LG frontend also saves
+ * `widgets_values_named`, which carries no positional ambiguity; when it is
+ * present we trust it over the positional array and reassign every known widget
+ * by name.
+ */
+function restoreWidgetsByName(node, info) {
+    const named = info?.widgets_values_named;
+    if (!named || typeof named !== "object") {
+        return
+    }
+    let restored = 0;
+    for (const widget of node.widgets ?? []) {
+        if (widget.name && widget.name in named && widget.value !== named[widget.name]) {
+            widget.value = named[widget.name];
+            restored++;
+        }
+    }
+    if (restored) {
+        console.info(`vLLM-Omni: re-aligned ${restored} widget values by name on "${node.title}".`);
+    }
+}
+
 const mark = new Image();
 let markReady = false;
 mark.addEventListener("load", () => {
@@ -275,14 +304,14 @@ app.registerExtension({
             };
         }
 
-        if (nodeData.name === "VLLMOmniGenerateVideo") {
-            const onConfigure = nodeType.prototype.onConfigure;
-            nodeType.prototype.onConfigure = function (info) {
-                onConfigure?.apply(this, arguments);
+        const onConfigure = nodeType.prototype.onConfigure;
+        nodeType.prototype.onConfigure = function (info) {
+            onConfigure?.apply(this, arguments);
+            restoreWidgetsByName(this, info);
+            if (nodeData.name === "VLLMOmniGenerateVideo") {
                 migrateNumFramesToDuration(this, info);
-            };
-        }
-
+            }
+        };
         // Defining this replaces the default dot outright — LiteGraph draws its
         // own square or circle only for nodes that leave onDrawTitleBox unset.
         nodeType.prototype.onDrawTitleBox = function (ctx, titleHeight, _size, scale) {

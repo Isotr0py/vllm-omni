@@ -86,9 +86,11 @@ To build a simple workflow yourself,
     - For some multi-stage models like BAGEL, [only one stage's sampling parameters are exposed and tunable via vLLM-Omni's online serving API](https://docs.vllm.ai/projects/vllm-omni/en/latest/user_guide/examples/online_serving/bagel/). Thus, these models are treated as single-stage ones. Please check the vLLM-Omni documentation on how to correctly set each model's sampling parameters.
     - For multi-stage models where all stages are either autoregression or diffusion, you can also connect only a single Sampling Params node, indicating that this set of sampling parameters will be used for all stages.
 - **Generate Image** requests the server encode results as WebP by default (`output_format` + `output_compression` widgets) to cut transfer size on slow links; switch to `png` for lossless.
+- Widgets in workflows saved against an older node layout are re-aligned by name on load, so stale graphs no longer shift values onto the wrong fields.
 - If you want to apply LoRA adapters, grab **vLLM-Omni -> LoRA** nodes.
     - **LoRA** nodes chain like ComfyUI's native LoraLoader: connect one **LoRA** node's output into the next **LoRA** node's `lora` input to stack adapters, and connect the last one to the generation node's `lora` input. A single **LoRA** node can also feed `lora` directly.
-    - Each **LoRA** keeps its own `scale` (from -4.0 to 4.0, matching ComfyUI's native LoraLoader); the server composes all adapters on the chain into one for the request. A chain of two or more is sent as a `lora` array, which requires a vLLM-Omni server that accepts stacked LoRA adapters.
+    - Each **LoRA** keeps its own `scale` (from -4.0 to 4.0, matching ComfyUI's native LoraLoader); the server composes all adapters on the chain into one for the request. A chain of two or more is sent as a `lora` array, which requires a vLLM-Omni server that accepts stacked LoRA adapters. Setting a node's `scale` to 0 drops that adapter from the composition without rewiring.
+    - To flip a turbo/distilled LoRA on and off together with its sampling regime, add a **Turbo LoRA Switch** node: it outputs turbo sampling params (its own `steps`/`cfg` widgets, 8 / 1 by default) plus a `turbo lora scale` (1.0/0.0). Feed the latter into the turbo LoRA node's `scale` widget (right-click the widget -> convert widget to input).
 
 ## Screenshots and Examples
 
