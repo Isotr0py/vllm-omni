@@ -250,6 +250,8 @@ class VLLMOmniClient:
         video: VideoInput | None = None,
         sampling_params: dict | list[dict] | None = None,
         lora: dict | list[dict] | None = None,
+        output_format: str = "png",
+        output_compression: int = 90,
     ) -> torch.Tensor:
         payload = VLLMOmniClient._prepare_chat_completion_messages(
             model=model,
@@ -262,6 +264,8 @@ class VLLMOmniClient:
             modalities=["image"],
             # === below are additional `extra_body` fields, handled by **kwargs ===
             lora=lora,
+            output_format=output_format,
+            output_compression=output_compression,
         )
         choices = await self._generate_base_chat_completion(model, payload)
 

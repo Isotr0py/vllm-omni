@@ -187,6 +187,8 @@ class VLLMOmniGenerateImage(_VLLMOmniGenerateBase):
             video=video,
             sampling_params=sampling_params,
             lora=lora,
+            output_format=output_format,
+            output_compression=output_compression,
         )
 
         return (output,)
