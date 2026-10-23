@@ -30,7 +30,7 @@ from vllm_omni.diffusion.lora.utils import (
     _match_target_modules,
     from_layer_diffusion,
 )
-from vllm_omni.lora.utils import stable_lora_int_id
+from vllm_omni.lora.utils import round_lora_scale, stable_lora_int_id
 
 logger = init_logger(__name__)
 
@@ -94,8 +94,8 @@ class DiffusionLoRAManager:
         device: torch.device,
         dtype: torch.dtype,
         max_cached_adapters: int = 1,
-        lora_path: str | list[str] | None = None,
-        lora_scale: float | list[float] = 1.0,
+        lora_path: str | None = None,
+        lora_scale: float = 1.0,
         max_num_batched_tokens: int | None = None,
     ):
         """
@@ -181,37 +181,16 @@ class DiffusionLoRAManager:
 
         try:
             if lora_path is not None:
-                if isinstance(lora_path, (list, tuple)):
-                    lora_paths = list(lora_path)
-                    if isinstance(lora_scale, (list, tuple)):
-                        lora_scales = list(lora_scale)
-                    else:
-                        lora_scales = [lora_scale] * len(lora_paths)
-                    if len(lora_scales) != len(lora_paths):
-                        raise ValueError(
-                            f"lora_path has {len(lora_paths)} entries but lora_scale has {len(lora_scales)}"
-                        )
-                    logger.info("Loading %d LoRAs during initialization from %s", len(lora_paths), lora_paths)
-                    init_requests = [
-                        LoRARequest(
-                            lora_name="static" if len(lora_paths) == 1 else f"static_{index}",
-                            lora_int_id=stable_lora_int_id(path),
-                            lora_path=path,
-                        )
-                        for index, path in enumerate(lora_paths)
-                    ]
-                    self.set_active_adapters(init_requests, lora_scales)
-                else:
-                    logger.info("Loading LoRA during initialization from %s with scale %.2f", lora_path, lora_scale)
-                    init_request = LoRARequest(
-                        lora_name="static",
-                        lora_int_id=stable_lora_int_id(lora_path),
-                        lora_path=lora_path,
-                    )
-                    self._fixed_adapter_request = init_request if self._fixed_adapter else None
-                    self.set_active_adapter(init_request, 1.0 if self._fixed_adapter else lora_scale)
-                    if self._fixed_adapter:
-                        self.pin_adapter(init_request.lora_int_id)
+                logger.info("Loading LoRA during initialization from %s with scale %.2f", lora_path, lora_scale)
+                init_request = LoRARequest(
+                    lora_name="static",
+                    lora_int_id=stable_lora_int_id(lora_path),
+                    lora_path=lora_path,
+                )
+                self._fixed_adapter_request = init_request if self._fixed_adapter else None
+                self.set_active_adapter(init_request, 1.0 if self._fixed_adapter else lora_scale)
+                if self._fixed_adapter:
+                    self.pin_adapter(init_request.lora_int_id)
             bind = getattr(pipeline, "_bind_diffusion_lora_manager", None)
             if callable(bind):
                 bind(self)
@@ -498,21 +477,22 @@ class DiffusionLoRAManager:
         pairs: list[tuple[LoRARequest, float]],
     ) -> int:
         """Load the source adapters, compose them, and register the result as
-        a regular adapter so the standard activation/cache paths apply."""
-        for request, _ in pairs:
-            if request.lora_int_id not in self._registered_adapters:
-                self.add_adapter(request)
-            else:
-                self._touch_adapter_info(request.lora_int_id)
+        a regular adapter so the standard activation/cache paths apply.
 
+        Source adapters are used only until ``torch.cat`` in
+        ``_compose_lora_models``: cached ones are reused, missing ones are
+        loaded transiently without entering the LRU cache, so stacking works
+        with any ``max_cached_adapters`` value (including the default of 1).
+        """
         specs: list[tuple[LoRAModel, float]] = []
         for request, scale in pairs:
             lora_model = self._registered_adapters.get(request.lora_int_id)
-            if lora_model is None:
-                raise ValueError(
-                    f"LoRA adapter {request.lora_int_id} was evicted before composition; "
-                    "increase max_cached_adapters (max_cpu_loras) to hold all stacked adapters."
-                )
+            if lora_model is not None:
+                self._touch_adapter_info(request.lora_int_id)
+            else:
+                # Transient load for composition only; never registered, so it
+                # cannot evict (or be evicted from) the adapter cache.
+                lora_model, _ = self._load_adapter(request)
             specs.append((lora_model, scale))
 
         composed_key_repr = repr(key)
@@ -613,19 +593,18 @@ class DiffusionLoRAManager:
         self._adapter_access_order.move_to_end(adapter_id)
 
     def _update_adapter_scale(self, adapter_id: int, lora_scale: float):
-        """Update the adapter scale for a given adapter ID. To avoid potential
-        issues with using Floats as keys, for now, we round float values to
-        3 decimal points.
-        """
+        """Update the adapter scale for a given adapter ID."""
         scale = DiffusionLoRAManager._get_rounded_scale(lora_scale)
         self._adapter_scales[adapter_id] = scale
 
     @staticmethod
     def _get_rounded_scale(lora_scale: float):
         """Normalizes a lora scale for use as a key in the _adapter_scales
-        dict; for now we just round scales to 3 decimal places.
+        dict and in composed-adapter keys. Delegates to the canonical
+        ``round_lora_scale`` so manager identity always matches the scheduler
+        batch key and KV-cache namespace quantization.
         """
-        return round(lora_scale, 3)
+        return round_lora_scale(lora_scale)
 
     def _load_adapter(
         self,

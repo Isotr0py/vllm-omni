@@ -122,12 +122,16 @@ def parse_lora_request(lora_body: Any) -> tuple[LoRARequest | None, float | None
     return LoRARequest(str(lora_name), int(lora_int_id), str(lora_path)), scale
 
 
-def parse_lora_requests(lora_body: Any) -> tuple[list[LoRARequest] | None, list[float] | None]:
-    """Parse a request-level LoRA object or array of objects into aligned lists.
+def parse_lora_requests(
+    lora_body: Any,
+) -> tuple[LoRARequest | list[LoRARequest] | None, float | list[float] | None]:
+    """Parse a request-level LoRA object or array of objects.
 
     Accepts the legacy single-object shape (see ``parse_lora_request``) or a
     non-empty list of such objects to stack multiple adapters on one request.
-    Per-adapter scales default to 1.0 when omitted.
+    A single object (or a one-element array) keeps the legacy scalar
+    ``(LoRARequest, float)`` shape; only a genuine stack of 2+ adapters
+    produces lists. Per-adapter scales default to 1.0 when omitted.
 
     Raises:
         ValueError: If any object shape is invalid or required fields are missing.
@@ -147,6 +151,8 @@ def parse_lora_requests(lora_body: Any) -> tuple[list[LoRARequest] | None, list[
             raise ValueError("Invalid lora field: array items must be objects.")
         lora_requests.append(lora_request)
         lora_scales.append(lora_scale if lora_scale is not None else 1.0)
+    if len(lora_requests) == 1:
+        return lora_requests[0], lora_scales[0]
     return lora_requests, lora_scales
 
 

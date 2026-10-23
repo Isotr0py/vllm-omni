@@ -40,15 +40,23 @@ class TestParseLoraRequests:
         assert parse_lora_requests(None) == (None, None)
 
     def test_single_dict_backward_compatible(self) -> None:
-        lora_requests, scales = parse_lora_requests({"name": "a", "path": "/tmp/a", "scale": 0.7})
-        assert len(lora_requests) == 1
-        assert lora_requests[0].lora_name == "a"
-        assert scales == [0.7]
+        # A single object keeps the legacy scalar shape so model-specific
+        # pipeline hooks that read lora_request/lora_scale directly keep working.
+        lora_request, scale = parse_lora_requests({"name": "a", "path": "/tmp/a", "scale": 0.7})
+        assert isinstance(lora_request, LoRARequest)
+        assert lora_request.lora_name == "a"
+        assert scale == 0.7
+
+    def test_one_element_array_unwraps_to_scalar(self) -> None:
+        lora_request, scale = parse_lora_requests([{"name": "a", "path": "/tmp/a", "scale": 0.7}])
+        assert isinstance(lora_request, LoRARequest)
+        assert lora_request.lora_name == "a"
+        assert scale == 0.7
 
     def test_scale_defaults_to_one(self) -> None:
-        lora_requests, scales = parse_lora_requests({"name": "a", "path": "/tmp/a"})
-        assert len(lora_requests) == 1
-        assert scales == [1.0]
+        lora_request, scale = parse_lora_requests({"name": "a", "path": "/tmp/a"})
+        assert isinstance(lora_request, LoRARequest)
+        assert scale == 1.0
 
     def test_list_of_dicts(self) -> None:
         lora_requests, scales = parse_lora_requests(

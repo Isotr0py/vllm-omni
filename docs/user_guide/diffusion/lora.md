@@ -88,6 +88,11 @@ Constraints:
 - The summed rank of the stacked adapters must not exceed **512** per layer.
   Two or three typical LoRAs (rank 4-64) fit comfortably.
 - Adapters with a scale of approximately 0 are skipped.
+- Stacking adapters on packed (merged-projection) layers such as fused QKV is
+  not supported yet.
+- Pipelines with model-specific LoRA hooks (e.g. MiniMax-H3 turbo/native,
+  whose adapters pin a sampler contract) reject stacked requests with a
+  client error instead of stacking them.
 
 Offline: pass a list of `LoRARequest` objects together with a matching list of
 scales:
@@ -111,17 +116,6 @@ single object (a single object remains valid):
 ```
 
 `int_id` is optional; when omitted it is derived from `local_path`.
-
-To pre-load and stack several adapters at server startup, pass multiple paths
-to `--lora-path` with optional matching `--lora-scale` values:
-
-```bash
-vllm serve circlestone-labs/Anima \
-  --omni \
-  --lora-backend peft \
-  --lora-path /path/to/style.safetensors /path/to/character.safetensors \
-  --lora-scale 0.8 0.6
-```
 
 #### Distill backend: fuse distilled LoRA at init
 

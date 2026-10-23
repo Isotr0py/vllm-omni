@@ -18,6 +18,7 @@ from tests.diffusion.lora.helpers import (
 )
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
 from vllm_omni.lora.request import LoRARequest
+from vllm_omni.lora.utils import build_lora_batch_key
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -1097,9 +1098,9 @@ def test_scale_keys_are_rounded():
         dtype=torch.bfloat16,
     )
     adapter_id = 1
-    # Currently we round keys to 3 decimal places
-    manager._update_adapter_scale(adapter_id, 0.0031)
-    assert manager._adapter_scales[adapter_id] == 0.003
+    # Scales are quantized to the canonical 4 decimal places (round_lora_scale).
+    manager._update_adapter_scale(adapter_id, 0.00316)
+    assert manager._adapter_scales[adapter_id] == 0.0032
 
 
 def test_lora_manager_uses_valid_max_rank(monkeypatch):
@@ -1679,28 +1680,50 @@ def test_set_active_adapters_single_and_empty_fall_back(monkeypatch):
     assert sorted(load_calls) == [1, 2]
 
 
-def test_set_active_adapters_composed_eviction_coexists_with_sources(monkeypatch):
-    """Composed entries share the adapter LRU: with capacity 3 the two sources
-    plus one composed adapter fit; a second combo evicts the LRU (the first
-    composed adapter) while both sources stay registered."""
-    manager, _, load_calls, activations = _composed_harness(monkeypatch, max_cached_adapters=3)
+def test_set_active_adapters_composed_eviction_with_transient_sources(monkeypatch):
+    """Stacking loads missing sources transiently (never registered), so it
+    works with the default cache capacity of 1; composed adapters still share
+    the adapter LRU and evict each other, purging their composed-cache keys."""
+    manager, _, load_calls, activations = _composed_harness(monkeypatch, max_cached_adapters=1)
     req1, req2 = _dummy_lora_request(1), _dummy_lora_request(2)
 
     manager.set_active_adapters([req1, req2], [1.0, 1.0])
     first_composed_id = activations[-1][0]
-    assert set(manager.list_adapters()) == {1, 2, first_composed_id}
+    assert manager.list_adapters() == [first_composed_id], "sources must not occupy the adapter cache"
     assert len(manager._composed_adapters) == 1
 
-    # A new combo needs a 4th slot: registering it evicts the LRU entry, which
-    # is the first composed adapter; its composed-cache key is purged too.
+    # A new combo with a single slot: registering it evicts the LRU entry,
+    # which is the first composed adapter; its composed-cache key is purged.
     manager.set_active_adapters([req1, req2], [0.5, 1.0])
     second_composed_id = activations[-1][0]
     assert second_composed_id != first_composed_id
-    assert set(manager.list_adapters()) == {1, 2, second_composed_id}
-    assert sorted(load_calls) == [1, 2], "sources must stay cached across combos"
+    assert manager.list_adapters() == [second_composed_id]
     assert all(cid != first_composed_id for cid in manager._composed_adapters.values())
+    # Sources were reloaded transiently for the second composition.
+    assert sorted(load_calls) == [1, 1, 2, 2]
 
     # Removing a composed adapter also drops its composed-cache key.
     manager.remove_adapter(second_composed_id)
     assert second_composed_id not in manager._registered_adapters
     assert manager._composed_adapters == {}
+
+
+def test_stacked_scale_keys_match_scheduler_batch_key():
+    """Regression: the manager's composed-adapter key and the scheduler/KV
+    batch key must quantize scales identically; otherwise requests scheduled
+    into separate batches could share an adapter composed at another scale."""
+    req_a, req_b = _dummy_lora_request(1), _dummy_lora_request(2)
+    scale_sets = ([0.5001, 0.7], [0.5004, 0.7], [0.12345, 0.67895], [1.0, 1.0])
+    keys = []
+    for scales in scale_sets:
+        batch_key = build_lora_batch_key([req_a, req_b], scales)
+        manager_key = tuple(
+            sorted(
+                (req.lora_int_id, DiffusionLoRAManager._get_rounded_scale(s)) for req, s in zip([req_a, req_b], scales)
+            )
+        )
+        assert batch_key == manager_key
+        keys.append(batch_key)
+    # The first three combos must stay distinct (they differ at/below the
+    # canonical quantization step), so each gets its own composed adapter.
+    assert len(set(keys)) == len(scale_sets)

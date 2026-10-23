@@ -119,9 +119,10 @@ def _post_image(server: OmniServer, payload: dict) -> np.ndarray:
     "omni_server",
     [
         pytest.param(
-            # max_cpu_loras must hold both source adapters plus the composed
-            # one; the default (1) evicts a source adapter mid-composition.
-            OmniServerParams(model=MODEL, server_args=["--enforce-eager", "--max-cpu-loras", "3"]),
+            # Default adapter cache (max_cpu_loras=1): stacked requests must
+            # work without raising the cache because sources are loaded
+            # transiently for composition.
+            OmniServerParams(model=MODEL, server_args=["--enforce-eager"]),
             id="single_card_multi_lora",
             marks=SINGLE_CARD_FEATURE_MARKS,
         )
