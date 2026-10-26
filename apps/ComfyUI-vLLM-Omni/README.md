@@ -51,6 +51,7 @@ This extension offers the following nodes based on the output modalities (at **C
 - **Generate Video** for text-to-video, first-frame/image-to-video, and reference-conditioned video
 - **Latent Mask Editing** for MiniMax-H3 latent-mask editing (source media plus video/audio noise masks)
 - **FastH3 Deployment** for routing text-to-video requests to a MiniMax-H3 server with FastH3 fused at startup
+- **ControlNet** for control-image-conditioned image generation against a server started with a ControlNet adapter (e.g. Anima ControlNet-LLLite)
 - **Multimodality Understanding** for multimodality-to-text and multimodality-to-audio tasks
 - **TTS** and **TTS Voice Clone** for TTS tasks
 - **Generate Music** for lyrics-and-description-to-music generation
@@ -67,7 +68,7 @@ Every node carries the vLLM-Omni mark in its title bar and is tinted by what it 
 | Blue | Generate Image, Generate Video, Multimodality Understanding, TTS, TTS Voice Clone | A generated image, video, audio, or text. These are the only nodes that reach a server. |
 | Amber | AR / Diffusion / Multi-Stage Sampling Params | Sampling parameters that apply to any model |
 | Purple | Qwen TTS Params, Wan Video Params, MiniMax-H3 Video Params | Parameters that only one model family accepts |
-| Red | LoRA, FastH3 Deployment | Which weights the server is expected to have loaded |
+| Red | LoRA, FastH3 Deployment, ControlNet | Which weights the server is expected to have loaded |
 | Teal | Video References, Latent Mask Editing | Reference media |
 
 Recolouring a node by hand (right click -> Colors) overrides its tint, and the choice is kept.
@@ -130,6 +131,8 @@ You can configure per-stage sampling parameters for multi-stage models.
 
 > [!TIP]
 > The node automatically choose text-to-image or image-to-image API endpoints depending on whether you connect an image input or not.
+>
+> For ControlNet-conditioned generation (e.g. Anima with a ControlNet-LLLite adapter loaded at server startup via `controlnet_path`), connect a **ControlNet** node to the `controlnet` input instead of the `image` input. It carries the control image plus `strength`, `start_percent`, and `end_percent`; do not wire `image` and `controlnet` at the same time.
 
 ### Text-to-video and image-to-video generation (e.g., Wan, MiniMax-H3)
 

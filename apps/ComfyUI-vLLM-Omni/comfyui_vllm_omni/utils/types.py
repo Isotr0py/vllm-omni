@@ -48,6 +48,10 @@ class FastH3Deployment(dict):
     """Descriptor for a server that fused FastH3 at startup."""
 
 
+class RemoteControlNet(dict):
+    """Control image plus strength/timing window for a server-side ControlNet adapter."""
+
+
 class ModelMode(Enum):
     IMAGE_GENERATION = auto()
     VIDEO_GENERATION = auto()

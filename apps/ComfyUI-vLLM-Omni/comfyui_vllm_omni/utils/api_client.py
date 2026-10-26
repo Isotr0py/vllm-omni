@@ -170,6 +170,7 @@ class VLLMOmniClient:
         mask: torch.Tensor | None = None,
         sampling_params: dict | None = None,
         lora: dict | list[dict] | None = None,
+        controlnet: dict | None = None,
         output_format: str = "webp",
         output_compression: int = 90,
     ) -> torch.Tensor:
@@ -197,6 +198,10 @@ class VLLMOmniClient:
                 form.add_field(k, str(v))
         if lora is not None:
             form.add_field("lora", json.dumps(lora, ensure_ascii=False))
+        if controlnet is not None:
+            form.add_field("controlnet_strength", str(controlnet["strength"]))
+            form.add_field("controlnet_start", str(controlnet["start"]))
+            form.add_field("controlnet_end", str(controlnet["end"]))
         if mask is not None:
             mask_filename = "mask.png"
             form.add_field(

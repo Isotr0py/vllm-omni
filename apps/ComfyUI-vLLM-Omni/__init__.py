@@ -16,6 +16,7 @@ __version__ = "0.0.1"
 
 from .comfyui_vllm_omni.nodes import (
     VLLMOmniARSampling,
+    VLLMOmniControlNet,
     VLLMOmniDiffusionSampling,
     VLLMOmniFastH3Deployment,
     VLLMOmniGenerateImage,
@@ -53,6 +54,7 @@ NODE_CLASS_MAPPINGS = {
     "VLLMOmniSamplingParamsList": VLLMOmniSamplingParamsList,
     "VLLMOmniTurboLoRASwitch": VLLMOmniTurboLoRASwitch,
     "VLLMOmniRemoteLoRA": VLLMOmniRemoteLoRA,
+    "VLLMOmniControlNet": VLLMOmniControlNet,
     "VLLMOmniFastH3Deployment": VLLMOmniFastH3Deployment,
     "VLLMOmniQwenTTSParams": VLLMOmniQwenTTSParams,
     "VLLMOmniWanParams": VLLMOmniWanParams,
@@ -77,6 +79,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "VLLMOmniSamplingParamsList": "Multi-Stage Sampling Params List",
     "VLLMOmniTurboLoRASwitch": "Turbo LoRA Switch",
     "VLLMOmniRemoteLoRA": "LoRA",
+    "VLLMOmniControlNet": "ControlNet",
     "VLLMOmniFastH3Deployment": "FastH3 Deployment",
     "VLLMOmniQwenTTSParams": "Qwen TTS Params",
     "VLLMOmniWanParams": "Wan Video Params",

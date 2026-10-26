@@ -2326,6 +2326,12 @@ async def edit_images(
     sys_type: str | None = Form(None),
     system_prompt: str | None = Form(None),
     return_stage_metrics: bool | None = Form(None),
+    # vllm-omni extension for ControlNet-style conditioning (e.g. Anima
+    # ControlNet-LLLite): the input image doubles as the control image and
+    # these overrides reach the pipeline via prompt["additional_information"].
+    controlnet_strength: float | None = Form(None),
+    controlnet_start: float | None = Form(None),
+    controlnet_end: float | None = Form(None),
 ) -> ImageGenerationResponse:
     """
     OpenAI-compatible image edit endpoint.
@@ -2398,6 +2404,19 @@ async def edit_images(
         if reference_image is not None:
             loaded = await _load_input_images([reference_image], normalize_rgb=normalize_edit_images_rgb)
             omni_prompt["multi_modal_data"]["reference_image"] = loaded[0]
+
+        controlnet_overrides = {
+            "controlnet_strength": controlnet_strength,
+            "controlnet_start": controlnet_start,
+            "controlnet_end": controlnet_end,
+        }
+        controlnet_overrides = {key: value for key, value in controlnet_overrides.items() if value is not None}
+        if controlnet_overrides:
+            additional_information = omni_prompt.get("additional_information")
+            if not isinstance(additional_information, dict):
+                additional_information = {}
+                omni_prompt["additional_information"] = additional_information
+            additional_information.update(controlnet_overrides)
 
         # 3 Build sample params
         gen_params = OmniDiffusionSamplingParams()

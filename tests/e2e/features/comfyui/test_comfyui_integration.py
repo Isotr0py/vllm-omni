@@ -26,6 +26,7 @@ import requests
 import torch
 from comfy_api.input import AudioInput, VideoInput
 from comfyui_vllm_omni.nodes import (
+    VLLMOmniControlNet,
     VLLMOmniFastH3Deployment,
     VLLMOmniGenerateImage,
     VLLMOmniGenerateMusic,
@@ -78,6 +79,7 @@ class SamplingCase(NamedTuple):
 class SamplingKind(str, Enum):
     IMAGE_NONE = "image_none"
     IMAGE_DIFFUSION_SINGLE = "image_diffusion_single"
+    IMAGE_CONTROLNET = "image_controlnet"
     UNDERSTANDING_NONE = "understanding_none"
     UNDERSTANDING_AR_LIST = "understanding_ar_list"
     TTS_NONE = "tts_none"
@@ -378,6 +380,29 @@ def _build_mock_outputs(outputs: Iterable[OmniRequestOutput], sampling_case: Sam
                     **expected,
                 },
                 LORA_PARAMS,
+            )
+        elif sampling_case.kind is SamplingKind.IMAGE_CONTROLNET:
+            assert len(received_sampling_params_list) == 1
+            assert isinstance(prompt, dict)
+            multi_modal_data = prompt.get("multi_modal_data")
+            assert isinstance(multi_modal_data, dict)
+            control_images = multi_modal_data.get("image")
+            assert isinstance(control_images, list)
+            assert len(control_images) == 1
+            assert isinstance(control_images[0], Image.Image)
+            # The /v1/images/edits form fields must land in additional_information,
+            # which is where the Anima ControlNet pre-process func reads them.
+            additional_information = prompt.get("additional_information")
+            assert isinstance(additional_information, dict)
+            assert additional_information["controlnet_strength"] == 0.8
+            assert additional_information["controlnet_start"] == 0.1
+            assert additional_information["controlnet_end"] == 0.9
+            _assert_sampling_param_values(
+                received_sampling_params_list[0],
+                {
+                    "width": IMAGE_WIDTH,
+                    "height": IMAGE_HEIGHT,
+                },
             )
         elif sampling_case.kind is SamplingKind.UNDERSTANDING_NONE:
             assert len(received_sampling_params_list) == 3
@@ -759,6 +784,77 @@ async def test_image_generation_node(api_server: str, model: str, image_input: b
     assert len(result) == 1
     assert isinstance(result[0], torch.Tensor)
     assert result[0].shape == (1, IMAGE_WIDTH, IMAGE_HEIGHT, 3)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "server_case",
+    [
+        pytest.param(
+            ServerCase(
+                served_model="circlestone-labs/Anima",
+                stage_list=["diffusion"],
+                stage_configs=[_make_stage_config("diffusion")],
+                outputs=[_build_diffusion_image_output_for_images_endpoint()],
+            ),
+            id="anima-controlnet-dalle-edit-endpoint",
+        ),
+    ],
+    indirect=["server_case"],
+)
+@pytest.mark.parametrize(
+    "sampling_case",
+    [
+        pytest.param(
+            SamplingCase(kind=SamplingKind.IMAGE_CONTROLNET, sampling_params=None),
+            id="controlnet",
+        ),
+    ],
+    indirect=["sampling_case"],
+)
+async def test_image_controlnet_node(api_server: str):
+    """ControlNet carrier node: the control image must ride the edit endpoint's image
+    field and strength/start/end must reach the server as controlnet_* form fields."""
+    controlnet_node = VLLMOmniControlNet()
+    (controlnet,) = controlnet_node.get_controlnet(
+        image=torch.zeros((1, IMAGE_HEIGHT, IMAGE_WIDTH, 3), dtype=torch.float32),
+        strength=0.8,
+        start_percent=0.1,
+        end_percent=0.9,
+    )
+
+    node = VLLMOmniGenerateImage()
+    result = await node.generate(
+        url=api_server,
+        model="circlestone-labs/Anima",
+        prompt="masterpiece, best quality, score_7, 1girl, solo",
+        negative_prompt="worst quality, low quality",
+        width=IMAGE_WIDTH,
+        height=IMAGE_HEIGHT,
+        controlnet=controlnet,
+    )
+
+    assert isinstance(result, tuple)
+    assert len(result) == 1
+    assert isinstance(result[0], torch.Tensor)
+    assert result[0].shape == (1, IMAGE_WIDTH, IMAGE_HEIGHT, 3)
+
+
+@pytest.mark.asyncio
+async def test_generate_image_rejects_image_and_controlnet():
+    node = VLLMOmniGenerateImage()
+    image = torch.zeros((1, IMAGE_HEIGHT, IMAGE_WIDTH, 3), dtype=torch.float32)
+    (controlnet,) = VLLMOmniControlNet().get_controlnet(image=image, strength=1.0, start_percent=0.0, end_percent=1.0)
+    with pytest.raises(ValueError, match="either an image input or a ControlNet node"):
+        await node.generate(
+            url="http://localhost:1/v1",
+            model="circlestone-labs/Anima",
+            prompt="test",
+            width=IMAGE_WIDTH,
+            height=IMAGE_HEIGHT,
+            image=image,
+            controlnet=controlnet,
+        )
 
 
 @pytest.mark.asyncio

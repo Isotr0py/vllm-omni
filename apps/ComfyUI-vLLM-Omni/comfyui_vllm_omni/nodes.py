@@ -22,6 +22,7 @@ from .utils.types import (
     LatentMaskEditing,
     MiniMaxH3ModelSpecificParams,
     QwenTTSModelSpecificParams,
+    RemoteControlNet,
     VideoReferences,
     WanModelSpecificParams,
 )
@@ -95,6 +96,7 @@ class VLLMOmniGenerateImage(_VLLMOmniGenerateBase):
                 # "audio": ("AUDIO",),
                 "sampling_params": ("SAMPLING_PARAMS",),
                 "lora": ("REMOTE_LORA",),
+                "controlnet": ("REMOTE_CONTROLNET",),
             },
         }
 
@@ -118,6 +120,7 @@ class VLLMOmniGenerateImage(_VLLMOmniGenerateBase):
         video: VideoInput | None = None,  # Hidden & unused
         sampling_params: dict | list[dict] | None = None,
         lora: dict | list[dict] | None = None,
+        controlnet: dict | None = None,
         **kwargs,
     ):
         if kwargs:
@@ -127,6 +130,11 @@ class VLLMOmniGenerateImage(_VLLMOmniGenerateBase):
         output_compression = int(output_compression)
         if image is None and mask is not None:
             raise ValueError("Mask input provided without an image input.")
+        if controlnet is not None and image is not None:
+            raise ValueError(
+                "Provide either an image input or a ControlNet node, not both. "
+                "The server accepts a single control image per request."
+            )
 
         client = VLLMOmniClient(url)
 
@@ -139,7 +147,7 @@ class VLLMOmniGenerateImage(_VLLMOmniGenerateBase):
             # Now, simply convert single-item list to dict.
             if isinstance(sampling_params, list):
                 sampling_params = sampling_params[0]
-            if audio is None and image is None and video is None:
+            if audio is None and image is None and video is None and controlnet is None:
                 # No multimodal input --- use DALL-E image generation
                 logger.info("Using DALL-E image generation endpoint")
                 output = await client.generate_image(
@@ -154,23 +162,32 @@ class VLLMOmniGenerateImage(_VLLMOmniGenerateBase):
                     output_compression=output_compression,
                 )
                 return (output,)
-            elif image is not None and audio is None and video is None:
-                # Image and text input --- use DALL-E image edit
+            elif (image is not None or controlnet is not None) and audio is None and video is None:
+                # Image and text input --- use DALL-E image edit.
+                # A ControlNet node's control image rides the same `image` form field;
+                # the server pipeline (e.g. Anima) re-reads it as its control image.
                 logger.info("Using DALL-E image edit endpoint")
                 output = await client.edit_image(
                     model=model,
                     prompt=prompt,
-                    image=image,
+                    image=image if image is not None else controlnet["image"],
                     width=width,
                     height=height,
                     negative_prompt=negative_prompt,
                     mask=mask,
                     sampling_params=sampling_params,
                     lora=lora,
+                    controlnet=controlnet,
                     output_format=output_format,
                     output_compression=output_compression,
                 )
                 return (output,)
+
+        if controlnet is not None:
+            raise ValueError(
+                f"ControlNet input is not supported for model {model}: only single-stage diffusion models "
+                "served with a ControlNet adapter (e.g. Anima with controlnet_path) accept a control image."
+            )
 
         logger.info("Using chat completion endpoint")
         sampling_params = add_sampling_parameters_to_stage(
@@ -893,6 +910,71 @@ class VLLMOmniRemoteLoRA:
         if isinstance(lora, list):
             return (lora + [entry],)
         return ([lora, entry],)
+
+
+class VLLMOmniControlNet:
+    """Per-request control image and scheduling for a server-side ControlNet adapter.
+
+    The server must have been started with the adapter loaded (e.g. Anima with
+    ControlNet-LLLite via custom_pipeline_args controlnet_path); this node only
+    forwards the control image and its strength/timing window. Wire the output
+    into a Generate Image node's `controlnet` input.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "strength": (
+                    "FLOAT",
+                    {"default": 1.0, "min": 0.0, "max": 4.0, "step": 0.05},
+                ),
+                "start_percent": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 1.0,
+                        "step": 0.01,
+                        "tooltip": "Fraction of the denoising trajectory at which control starts.",
+                    },
+                ),
+                "end_percent": (
+                    "FLOAT",
+                    {
+                        "default": 1.0,
+                        "min": 0.0,
+                        "max": 1.0,
+                        "step": 0.01,
+                        "tooltip": "Fraction of the denoising trajectory at which control ends.",
+                    },
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("REMOTE_CONTROLNET",)
+    RETURN_NAMES = ("controlnet",)
+    FUNCTION = "get_controlnet"
+    CATEGORY = "vLLM-Omni"
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, start_percent, end_percent) -> str | Literal[True]:
+        if not 0.0 <= start_percent < end_percent <= 1.0:
+            return "Require 0.0 <= start_percent < end_percent <= 1.0."
+        return True
+
+    def get_controlnet(self, image: torch.Tensor, strength: float, start_percent: float, end_percent: float):
+        return (
+            RemoteControlNet(
+                {
+                    "image": image,
+                    "strength": float(strength),
+                    "start": float(start_percent),
+                    "end": float(end_percent),
+                }
+            ),
+        )
 
 
 class VLLMOmniTurboLoRASwitch:

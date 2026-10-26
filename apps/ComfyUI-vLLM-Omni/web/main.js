@@ -195,6 +195,7 @@ const FAMILY_BY_OUTPUT = {
     TTS_PARAMS: "model",
     VIDEO_PARAMS: "model",
     REMOTE_LORA: "deployment",
+    REMOTE_CONTROLNET: "deployment",
     FASTH3_DEPLOYMENT: "deployment",
     VIDEO_REFERENCES: "media",
     LATENT_MASK_EDITING: "media",
