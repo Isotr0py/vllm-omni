@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
+import PIL.Image
 import torch
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
@@ -28,16 +29,20 @@ from vllm_omni.diffusion.models.anima.anima_text_conditioner import (
     AnimaTextConditioner,
 )
 from vllm_omni.diffusion.models.anima.anima_transformer import ANIMA_TRANSFORMER_CONFIG, AnimaTransformer3DModel
+from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offload_strategy
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
+from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.size_utils import normalize_min_aligned_size
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.inputs.data import OmniTextPrompt
 
 if TYPE_CHECKING:
     from vllm.lora.lora_model import LoRAModel
     from vllm.lora.peft_helper import PEFTHelper
 
+    from vllm_omni.diffusion.models.anima.controlnet import AnimaControlNetLLLite
     from vllm_omni.lora.request import LoRARequest
 
 logger = logging.getLogger(__name__)
@@ -139,7 +144,62 @@ def get_anima_post_process_func(od_config: OmniDiffusionConfig) -> Callable[[tor
     return post_process_func
 
 
-class AnimaPipeline(nn.Module, DiffusionPipelineProfilerMixin, ProgressBarMixin):
+def _anima_control_image_structure(value: Any) -> tuple:
+    if value is None:
+        return ("none",)
+    if isinstance(value, str):
+        return ("path", value)
+    if isinstance(value, PIL.Image.Image):
+        return ("image", value.size)
+    return (type(value).__name__,)
+
+
+def get_anima_pre_process_func(
+    od_config: OmniDiffusionConfig,
+) -> Callable[[OmniDiffusionRequest], OmniDiffusionRequest]:
+    """Pre-process function for Anima ControlNet-LLLite control images.
+
+    Normalizes the control image from ``multi_modal_data`` ("image" or
+    "control_image", a path or PIL.Image) into a single RGB PIL image stored
+    in ``additional_information['control_image']``, and passes through the
+    optional controlnet_strength/controlnet_start/controlnet_end overrides.
+    """
+
+    def pre_process_func(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
+        prompt = request.prompt
+        multi_modal_data = prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else None
+        if isinstance(prompt, str):
+            prompt = OmniTextPrompt(prompt=prompt)
+        if "additional_information" not in prompt:
+            prompt["additional_information"] = {}
+
+        control_image = None
+        if multi_modal_data:
+            control_image = multi_modal_data.get("image") or multi_modal_data.get("control_image")
+            if isinstance(control_image, list):
+                control_image = control_image[0] if control_image else None
+            if isinstance(control_image, str):
+                control_image = PIL.Image.open(control_image).convert("RGB")
+            elif isinstance(control_image, PIL.Image.Image):
+                control_image = control_image.convert("RGB")
+            if control_image is not None:
+                prompt["additional_information"]["control_image"] = control_image
+            for key in ("controlnet_strength", "controlnet_start", "controlnet_end"):
+                value = multi_modal_data.get(key, prompt["additional_information"].get(key))
+                if value is not None:
+                    prompt["additional_information"][key] = value
+
+        request.batch_compatibility_key = (
+            "anima_control_image",
+            _anima_control_image_structure(control_image),
+        )
+        request.prompt = prompt
+        return request
+
+    return pre_process_func
+
+
+class AnimaPipeline(nn.Module, DiffusionPipelineProfilerMixin, ProgressBarMixin, SupportImageInput):
     """Native Anima model path.
 
     The Anima transformer checkpoint is distributed as a single safetensors
@@ -166,6 +226,11 @@ class AnimaPipeline(nn.Module, DiffusionPipelineProfilerMixin, ProgressBarMixin)
         self._num_timesteps = 0
         self._current_timestep = None
         self._profiler_initialized = False
+
+        self.controlnet: AnimaControlNetLLLite | None = None
+        self._controlnet_strength = 1.0
+        self._controlnet_start = 0.0
+        self._controlnet_end = 1.0
 
     def _raise_unsupported_features(self) -> None:
         pc = self.od_config.parallel_config
@@ -279,6 +344,22 @@ class AnimaPipeline(nn.Module, DiffusionPipelineProfilerMixin, ProgressBarMixin)
         custom_args = self.od_config.custom_pipeline_args or {}
         return str(custom_args.get(f"{name}_model", custom_args.get(f"{name}_path", default_model)))
 
+    def _load_controlnet(self) -> "AnimaControlNetLLLite | None":
+        custom_args = self.od_config.custom_pipeline_args or {}
+        controlnet_path = custom_args.get("controlnet_model", custom_args.get("controlnet_path"))
+        if controlnet_path is None:
+            return None
+        from vllm_omni.diffusion.models.anima.controlnet import AnimaControlNetLLLite
+
+        controlnet = AnimaControlNetLLLite.from_single_file(
+            str(controlnet_path),
+            dtype=self.od_config.dtype,
+            device=self.device,
+        )
+        controlnet.apply_to(self.transformer)
+        logger.info("Loaded Anima ControlNet-LLLite from %s", controlnet_path)
+        return controlnet
+
     @staticmethod
     def _from_pretrained_kwargs(model: str, subfolder: str | None = None) -> dict[str, Any]:
         kwargs: dict[str, Any] = {"local_files_only": os.path.exists(model)}
@@ -355,6 +436,7 @@ class AnimaPipeline(nn.Module, DiffusionPipelineProfilerMixin, ProgressBarMixin)
         self.t5_tokenizer = t5_tokenizer
         self.vae = vae
         self.scheduler = scheduler
+        self.controlnet = self._load_controlnet()
 
         # The VAE is loaded lazily here, after registry.initialize_model() has
         # run, so its VAE optimization wiring must be applied manually.
@@ -596,6 +678,36 @@ class AnimaPipeline(nn.Module, DiffusionPipelineProfilerMixin, ProgressBarMixin)
             sigmas=sigmas,
         )
 
+    def _prepare_control_image(self, control_image: Any, height: int, width: int) -> torch.Tensor:
+        """Convert a control image to the pixel-space (1,3,H,W) [-1,1] tensor LLLite expects."""
+        patch_multiple = self.vae_scale_factor * 2
+        if height % patch_multiple != 0 or width % patch_multiple != 0:
+            raise ValueError(
+                f"Anima ControlNet requires height/width to be multiples of {patch_multiple} "
+                f"pixels (vae_scale_factor * patch size), got {height}x{width}."
+            )
+        if isinstance(control_image, str):
+            control_image = PIL.Image.open(control_image)
+        if not isinstance(control_image, PIL.Image.Image):
+            raise ValueError(f"Anima ControlNet control image must be a path or PIL.Image, got {type(control_image)}.")
+        control_image = control_image.convert("RGB").resize((width, height), PIL.Image.BICUBIC)
+        array = np.asarray(control_image, dtype=np.float32) / 255.0
+        tensor = torch.from_numpy(array).permute(2, 0, 1).unsqueeze(0).clamp_(0.0, 1.0)
+        tensor = tensor * 2.0 - 1.0
+        assert self.controlnet is not None
+        controlnet_param = next(self.controlnet.parameters())
+        return tensor.to(device=controlnet_param.device, dtype=controlnet_param.dtype)
+
+    @staticmethod
+    def _sigma_at_percent(percent: float, sigmas: torch.Tensor) -> float:
+        """Linear interpolation over the sigma schedule: 0 -> sigmas[0] (max), 1 -> sigmas[-1] (min)."""
+        percent = min(max(float(percent), 0.0), 1.0)
+        position = percent * (len(sigmas) - 1)
+        lower = int(position)
+        upper = min(lower + 1, len(sigmas) - 1)
+        fraction = position - lower
+        return float(sigmas[lower]) * (1.0 - fraction) + float(sigmas[upper]) * fraction
+
     def diffuse(
         self,
         prompt_embeds: torch.Tensor,
@@ -608,11 +720,23 @@ class AnimaPipeline(nn.Module, DiffusionPipelineProfilerMixin, ProgressBarMixin)
     ) -> torch.Tensor:
         self.scheduler.set_begin_index(0)
 
+        controlnet = getattr(self, "controlnet", None)
+        use_controlnet = controlnet is not None and controlnet.cond_emb is not None
+        if use_controlnet:
+            sigmas = self.scheduler.sigmas
+            sigma_start = self._sigma_at_percent(self._controlnet_start, sigmas)
+            sigma_end = self._sigma_at_percent(self._controlnet_end, sigmas)
+
         with self.progress_bar(total=len(timesteps)) as pbar:
             for i, t in enumerate(timesteps):
                 if self.interrupt:
                     continue
                 self._current_timestep = t
+
+                if use_controlnet:
+                    sigma = float(self.scheduler.sigmas[i])
+                    active = sigma_end <= sigma <= sigma_start
+                    controlnet.set_multiplier(self._controlnet_strength if active else 0.0)
 
                 # Broadcast timestep to match batch size
                 timestep = t.expand(latents.shape[0]).to(dtype=self.transformer.dtype, device=latents.device)
@@ -834,16 +958,37 @@ class AnimaPipeline(nn.Module, DiffusionPipelineProfilerMixin, ProgressBarMixin)
         )
         self._num_timesteps = len(timesteps)
 
+        # ControlNet-LLLite conditioning (optional)
+        control_image_set = False
+        controlnet = getattr(self, "controlnet", None)
+        if controlnet is not None:
+            strength = DiffusionRequestBatch.get_prompt_field(req.prompts[0], "controlnet_strength")
+            start = DiffusionRequestBatch.get_prompt_field(req.prompts[0], "controlnet_start")
+            end = DiffusionRequestBatch.get_prompt_field(req.prompts[0], "controlnet_end")
+            self._controlnet_strength = 1.0 if strength is None else float(strength)
+            self._controlnet_start = 0.0 if start is None else float(start)
+            self._controlnet_end = 1.0 if end is None else float(end)
+            control_image = DiffusionRequestBatch.get_prompt_field(req.prompts[0], "control_image")
+            if control_image is not None:
+                cond_tensor = self._prepare_control_image(control_image, height, width)
+                controlnet.set_cond_image(cond_tensor)
+                control_image_set = True
+
         # Denoise loop
-        latents = self.diffuse(
-            prompt_embeds=prompt_embeds,
-            negative_prompt_embeds=negative_prompt_embeds,
-            latents=latents,
-            padding_mask=padding_mask,
-            timesteps=timesteps,
-            do_true_cfg=do_true_cfg,
-            true_cfg_scale=true_cfg_scale,
-        )
+        try:
+            latents = self.diffuse(
+                prompt_embeds=prompt_embeds,
+                negative_prompt_embeds=negative_prompt_embeds,
+                latents=latents,
+                padding_mask=padding_mask,
+                timesteps=timesteps,
+                do_true_cfg=do_true_cfg,
+                true_cfg_scale=true_cfg_scale,
+            )
+        finally:
+            if control_image_set:
+                controlnet.clear_cond_image()
+                controlnet.set_multiplier(1.0)
 
         self._current_timestep = None
         return [self.decode_latents(latents, output_type=output_type)]

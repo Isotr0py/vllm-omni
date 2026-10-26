@@ -5,7 +5,7 @@ import contextlib
 import math
 from collections.abc import Iterable
 from types import SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -26,6 +26,9 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.distributed.hsdp_utils import is_transformer_block_module
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.models.anima.controlnet import AnimaControlNetLLLite, LLLiteModule
 
 ANIMA_TRANSFORMER_CONFIG = {
     "in_channels": 16,
@@ -104,9 +107,7 @@ def validate_anima_tp_constraints(
                 f"Supported tp candidates by {name}: {supported}"
             )
     return sorted(
-        _positive_divisors(num_attention_heads)
-        & _positive_divisors(hidden_size)
-        & _positive_divisors(ffn_inner_dim)
+        _positive_divisors(num_attention_heads) & _positive_divisors(hidden_size) & _positive_divisors(ffn_inner_dim)
     )
 
 
@@ -288,6 +289,10 @@ class CosmosFeedForward(nn.Module):
 
 
 class CosmosAttention(nn.Module):
+    # ControlNet-LLLite injection: (q_module, k_module, v_module, adapter) set
+    # per self-attn module by AnimaControlNetLLLite.apply_to / restore.
+    lllite: tuple["LLLiteModule", "LLLiteModule", "LLLiteModule", "AnimaControlNetLLLite"] | None = None
+
     def __init__(
         self,
         query_dim: int,
@@ -394,7 +399,32 @@ class CosmosAttention(nn.Module):
                 raise ValueError("Self-attention does not take encoder_hidden_states.")
             q_size = self.to_qkv.num_heads * self.dim_head
             kv_size = self.to_qkv.num_kv_heads * self.dim_head
-            query, key, value = self.to_qkv(hidden_states).split([q_size, kv_size, kv_size], dim=-1)
+            qkv = self.to_qkv(hidden_states)
+            if self.lllite is not None:
+                mod_q, mod_k, mod_v, net = self.lllite
+                if net.cond_emb is not None and net.multiplier != 0.0:
+                    cond_emb = net.cond_emb
+                    if cond_emb.shape[1] != seq_len:
+                        raise ValueError(
+                            "ControlNet-LLLite cond_emb sequence length mismatch: "
+                            f"expected {seq_len} image tokens (batch {batch_size}), got {cond_emb.shape[1]}. "
+                            "Resize the control image to (16 * token grid height, 16 * token grid width)."
+                        )
+                    e_q = mod_q.forward_correction(hidden_states, cond_emb, net.multiplier)
+                    e_k = mod_k.forward_correction(hidden_states, cond_emb, net.multiplier)
+                    e_v = mod_v.forward_correction(hidden_states, cond_emb, net.multiplier)
+                    if e_q is not None:
+                        w = self.to_qkv.weight
+                        corr = torch.cat(
+                            [
+                                F.linear(e_q, w[:q_size]),
+                                F.linear(e_k, w[q_size : q_size + kv_size]),
+                                F.linear(e_v, w[q_size + kv_size :]),
+                            ],
+                            dim=-1,
+                        )
+                        qkv = qkv + corr.to(qkv.dtype)
+            query, key, value = qkv.split([q_size, kv_size, kv_size], dim=-1)
             query = query.view(batch_size, seq_len, self.heads_local, self.dim_head)
             key = key.view(batch_size, seq_len, self.heads_local, self.dim_head)
             value = value.view(batch_size, seq_len, self.heads_local, self.dim_head)
