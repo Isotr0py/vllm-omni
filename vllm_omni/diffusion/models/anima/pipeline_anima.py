@@ -23,6 +23,7 @@ from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_qwenimage import DistributedAutoencoderKLQwenImage
 from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import DistributedVaeMixin
+from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.models.anima.anima_text_conditioner import (
     ANIMA_TEXT_CONDITIONER_CONFIG,
@@ -199,7 +200,7 @@ def get_anima_pre_process_func(
     return pre_process_func
 
 
-class AnimaPipeline(nn.Module, DiffusionPipelineProfilerMixin, ProgressBarMixin, SupportImageInput):
+class AnimaPipeline(nn.Module, DiffusionPipelineProfilerMixin, CFGParallelMixin, ProgressBarMixin, SupportImageInput):
     """Native Anima model path.
 
     The Anima transformer checkpoint is distributed as a single safetensors
@@ -234,8 +235,6 @@ class AnimaPipeline(nn.Module, DiffusionPipelineProfilerMixin, ProgressBarMixin,
 
     def _raise_unsupported_features(self) -> None:
         pc = self.od_config.parallel_config
-        if pc.cfg_parallel_size > 1:
-            raise NotImplementedError("AnimaPipeline does not yet support CFG parallel. Validate native CFG first.")
         if pc.sequence_parallel_size is not None and pc.sequence_parallel_size > 1:
             raise NotImplementedError("AnimaPipeline does not yet support sequence parallelism. Add an _sp_plan first.")
         if pc.use_hsdp:
@@ -745,29 +744,38 @@ class AnimaPipeline(nn.Module, DiffusionPipelineProfilerMixin, ProgressBarMixin,
                 # Predict noise
                 latent_model_input = latents.to(self.transformer.dtype)
 
-                # Positive pass
-                noise_pred = self.transformer(
-                    hidden_states=latent_model_input,
-                    timestep=timestep,
-                    encoder_hidden_states=prompt_embeds,
-                    padding_mask=padding_mask,
-                    return_dict=False,
-                )[0]
-
-                # Negative / uncond pass
+                positive_kwargs = {
+                    "hidden_states": latent_model_input,
+                    "timestep": timestep,
+                    "encoder_hidden_states": prompt_embeds,
+                    "padding_mask": padding_mask,
+                    "return_dict": False,
+                }
                 if do_true_cfg and negative_prompt_embeds is not None:
-                    noise_pred_uncond = self.transformer(
-                        hidden_states=latent_model_input,
-                        timestep=timestep,
-                        encoder_hidden_states=negative_prompt_embeds,
-                        padding_mask=padding_mask,
-                        return_dict=False,
-                    )[0]
-                    noise_pred = noise_pred_uncond + true_cfg_scale * (noise_pred - noise_pred_uncond)
+                    negative_kwargs = {
+                        "hidden_states": latent_model_input,
+                        "timestep": timestep,
+                        "encoder_hidden_states": negative_prompt_embeds,
+                        "padding_mask": padding_mask,
+                        "return_dict": False,
+                    }
+                else:
+                    negative_kwargs = None
+
+                # Predict noise with automatic CFG parallel handling; each rank
+                # runs one branch, so the ControlNet multiplier set above gates
+                # both branches. Anima does not use CFG output normalization.
+                noise_pred = self.predict_noise_maybe_with_cfg(
+                    do_true_cfg and negative_kwargs is not None,
+                    true_cfg_scale,
+                    positive_kwargs,
+                    negative_kwargs,
+                    cfg_normalize=False,
+                )
 
                 # Scheduler step
                 latents_dtype = latents.dtype
-                latents = self.scheduler.step(noise_pred.to(latents_dtype), t, latents, return_dict=False)[0]
+                latents = self.scheduler_step_maybe_with_cfg(noise_pred.to(latents_dtype), t, latents, do_true_cfg)
                 if latents.dtype != latents_dtype:
                     latents = latents.to(latents_dtype)
 
@@ -873,7 +881,9 @@ class AnimaPipeline(nn.Module, DiffusionPipelineProfilerMixin, ProgressBarMixin,
         else:
             batch_size = len(prompt)
 
+        has_neg_prompt = negative_prompt is not None
         do_true_cfg = guidance_scale > 1.0
+        self.check_cfg_parallel_validity(true_cfg_scale, has_neg_prompt)
 
         # Encode prompts
         enc_out = self.encode_prompt(
