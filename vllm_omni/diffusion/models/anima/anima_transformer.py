@@ -672,6 +672,7 @@ class CosmosLearnablePositionalEmbed(nn.Module):
 
 class AnimaTransformer3DModel(nn.Module):
     _repeated_blocks = ["CosmosTransformerBlock"]
+    _layerwise_offload_blocks_attrs = ["transformer_blocks"]
     _hsdp_shard_conditions = [is_transformer_block_module]
 
     def __init__(

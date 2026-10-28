@@ -20,9 +20,7 @@ from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from torch import nn
 
 import vllm_omni.diffusion.distributed.cfg_parallel as cfg_dist
-from vllm_omni.diffusion.models.anima import pipeline_anima as pipeline_mod
 from vllm_omni.diffusion.models.anima.pipeline_anima import AnimaPipeline
-from vllm_omni.diffusion.offloader.config import OffloadStrategy
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -132,8 +130,7 @@ def _reference_latents(
     return out
 
 
-def test_cfg_parallel_size_no_longer_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(pipeline_mod, "resolve_offload_strategy", lambda _cfg: OffloadStrategy.NONE)
+def test_cfg_parallel_size_no_longer_rejected() -> None:
     pipeline = AnimaPipeline.__new__(AnimaPipeline)
     pipeline.od_config = SimpleNamespace(
         parallel_config=SimpleNamespace(cfg_parallel_size=2, sequence_parallel_size=1, use_hsdp=False),

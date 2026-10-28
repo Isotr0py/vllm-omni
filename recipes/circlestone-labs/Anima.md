@@ -24,9 +24,10 @@ such as `text_encoder`, `tokenizer`, `t5_tokenizer`, `vae`, and optionally
 `scheduler` must be supplied through a Diffusers-layout components directory.
 
 Native Anima supports single-GPU execution and tensor parallelism (TP) on
-the DiT; see [Tensor Parallelism](#tensor-parallelism). Cache-DiT, TeaCache,
-CPU offload, layer-wise offload, quantization, SP, CFG parallel, HSDP, and
-step execution are not supported by `AnimaPipeline` yet.
+the DiT; see [Tensor Parallelism](#tensor-parallelism). CFG parallel and CPU
+offload (module mode and layer-wise, including distributed layer-wise with
+rank-local transfer) are supported. Cache-DiT, TeaCache, quantization, SP,
+HSDP, and step execution are not supported by `AnimaPipeline` yet.
 
 ## References
 
@@ -122,8 +123,8 @@ Check that `/tmp/anima_output.png` exists and contains a generated image.
 - Start with `max-concurrency=1` for correctness and latency validation.
 - Keep requests at the same resolution when comparing runs.
 - Tensor parallelism on the DiT is supported; see
-  [Tensor Parallelism](#tensor-parallelism). Do not enable sequence or CFG
-  parallelism, cache acceleration, offload, or quantized checkpoint flags for
+  [Tensor Parallelism](#tensor-parallelism). Do not enable sequence
+  parallelism, cache acceleration, or quantized checkpoint flags for
   Anima until support is added to `AnimaPipeline`.
 
 ## Tensor Parallelism
@@ -157,10 +158,12 @@ Notes on TP scope:
   projection), the Qwen3 text encoder, the text conditioner, and the VAE
   are replicated on every rank, so memory savings come mainly from the DiT.
 - TP composes with kohya LoRA loading and multi-LoRA stacking.
+- TP composes with CPU offload; per the DLO support boundary, TP > 1 uses
+  the ordinary-loader path (no direct checkpoint mmap), and block transfer
+  stays rank-local because TP groups are not DLO AllGather groups.
 - The img_context branch (image-to-image extension) is not
   tensor-parallelized and must stay disabled when `tensor_parallel_size > 1`.
-- TeaCache / Cache-DiT, quantization, and CPU / layer-wise offload remain
-  unsupported, with or without TP.
+- TeaCache / Cache-DiT and quantization remain unsupported, with or without TP.
 
 ## Online Serving
 

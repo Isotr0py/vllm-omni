@@ -7,7 +7,7 @@ import logging
 import os
 from collections.abc import Callable, Iterable
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import numpy as np
 import PIL.Image
@@ -30,9 +30,9 @@ from vllm_omni.diffusion.models.anima.anima_text_conditioner import (
     AnimaTextConditioner,
 )
 from vllm_omni.diffusion.models.anima.anima_transformer import ANIMA_TRANSFORMER_CONFIG, AnimaTransformer3DModel
-from vllm_omni.diffusion.models.interface import SupportImageInput
+from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
-from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offload_strategy
+from vllm_omni.diffusion.offloader.offload_plan import OffloadPlan
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.size_utils import normalize_min_aligned_size
@@ -200,7 +200,26 @@ def get_anima_pre_process_func(
     return pre_process_func
 
 
-class AnimaPipeline(nn.Module, DiffusionPipelineProfilerMixin, CFGParallelMixin, ProgressBarMixin, SupportImageInput):
+_ANIMA_OFFLOAD_PLAN = OffloadPlan(
+    # The Qwen3 text encoder is loaded with from_pretrained on every rank
+    # (never TP-sharded), so its block tensors are identical across the group
+    # and DLO AllGather transfer is safe for it. The DiT streams via the
+    # transformer's _layerwise_offload_blocks_attrs ("transformer_blocks").
+    resident_dit_paths=frozenset({"transformer"}),
+    encoder_component_types={"text_encoder": "text_encoder"},
+    encoder_block_attrs={"text_encoder": ("layers",)},
+    encoder_dlo_weight_replication=frozenset({"text_encoder"}),
+)
+
+
+class AnimaPipeline(
+    nn.Module,
+    DiffusionPipelineProfilerMixin,
+    CFGParallelMixin,
+    ProgressBarMixin,
+    SupportImageInput,
+    SupportsComponentDiscovery,
+):
     """Native Anima model path.
 
     The Anima transformer checkpoint is distributed as a single safetensors
@@ -212,6 +231,11 @@ class AnimaPipeline(nn.Module, DiffusionPipelineProfilerMixin, CFGParallelMixin,
     # The VAE is created in load_weights(), after registry.initialize_model();
     # VAE parallel/tiling settings are applied there instead.
     _deferred_distributed_vae = True
+
+    _dit_modules: ClassVar[list[str]] = ["transformer"]
+    _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
+    _vae_modules: ClassVar[list[str]] = ["vae"]
+    _offload_plan: ClassVar[OffloadPlan] = _ANIMA_OFFLOAD_PLAN
 
     def __init__(self, *, od_config: OmniDiffusionConfig, device: torch.device | str | None = None) -> None:
         super().__init__()
@@ -243,8 +267,6 @@ class AnimaPipeline(nn.Module, DiffusionPipelineProfilerMixin, CFGParallelMixin,
             raise NotImplementedError("AnimaPipeline does not yet support TeaCache or Cache-DiT.")
         if self.od_config.quantization_config is not None:
             raise NotImplementedError("AnimaPipeline does not yet support quantized checkpoints.")
-        if resolve_offload_strategy(self.od_config) is not OffloadStrategy.NONE:
-            raise NotImplementedError("AnimaPipeline does not yet support CPU offload.")
 
     @staticmethod
     def _sub_state_dict(state_dict: dict[str, torch.Tensor], prefix: str) -> dict[str, torch.Tensor]:

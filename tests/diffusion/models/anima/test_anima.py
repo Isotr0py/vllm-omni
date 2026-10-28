@@ -43,10 +43,10 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
         },
     ],
 )
-def test_native_anima_rejects_offload(offload_args):
+def test_native_anima_accepts_offload(offload_args):
+    """Module, layerwise, and distributed-layerwise offload are all supported."""
     config = OmniDiffusionConfig(model="anima.safetensors", **offload_args)
-    with pytest.raises(NotImplementedError, match="offload"):
-        AnimaPipeline(od_config=config, device=torch.device("cpu"))
+    AnimaPipeline(od_config=config, device=torch.device("cpu"))
 
 
 def test_native_anima_initializes_without_offload():
