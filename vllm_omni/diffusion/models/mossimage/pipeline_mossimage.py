@@ -23,11 +23,15 @@ ported from the training repository's finalized standalone pipeline
 Parallelism: tensor parallelism (QKV/FFN sharding), CFG parallelism
 (CFGParallelMixin), and Ulysses sequence parallelism (_sp_plan) are
 supported. Ring attention and TeaCache / Cache-DiT are not (ring attention
-cannot express the joint key-padding mask).
+cannot express the joint key-padding mask). The Qwen3.5 text encoder can be
+layer-slice sharded across the whole DiT world with ``text_encoder_tp_size``
+(see encoder_tp.py); the slice is not weight-replicated, so DLO AllGather is
+rejected for the text encoder in that mode (use rank-local transfer).
 """
 
 from __future__ import annotations
 
+import dataclasses
 import math
 import os
 from collections.abc import Iterable, Iterator, Sequence
@@ -48,6 +52,7 @@ from transformers import AutoModel, AutoTokenizer
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.parallel_state import get_world_group
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.guidance import (
     FlowMatchingPredictionAdapter,
@@ -61,6 +66,10 @@ from vllm_omni.diffusion.model_loader.hub_prefetch import (
     prefetch_subfolders,
 )
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
+from vllm_omni.diffusion.models.mossimage.encoder_tp import (
+    slice_text_encoder_for_tp,
+    text_encoder_tp_forward,
+)
 from vllm_omni.diffusion.models.mossimage.mossimage_transformer import MOSSImageTransformer
 from vllm_omni.diffusion.offloader.config import TEXT_ENCODER_COMPONENT, resolve_offload
 from vllm_omni.diffusion.offloader.offload_plan import OffloadPlan
@@ -184,6 +193,30 @@ class MOSSImagePipeline(nn.Module, SkipLayerGuidanceMixin, DiffusionPipelineProf
         self.parallel_config = od_config.parallel_config
         self._raise_on_unsupported_features(od_config)
 
+        # Text-encoder layer-slice TP (see encoder_tp.py). Every DiT rank must
+        # take part: the slice handoff broadcasts over the world group and all
+        # ranks consume the encoder output.
+        self.text_encoder_tp_size = int(getattr(self.parallel_config, "text_encoder_tp_size", 1) or 1)
+        self._te_rank = 0
+        self._te_device_group = None
+        if self.text_encoder_tp_size > 1:
+            if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+                raise ValueError("text_encoder_tp_size > 1 requires an initialized torch.distributed world")
+            world_size = get_world_group().world_size
+            if self.text_encoder_tp_size != world_size:
+                raise ValueError(
+                    "MOSS-Image shards the text encoder across every DiT rank: "
+                    f"text_encoder_tp_size must be 1 or the world size ({world_size}), "
+                    f"got {self.text_encoder_tp_size}"
+                )
+            self._te_rank = torch.distributed.get_rank()
+            self._te_device_group = get_world_group().device_group
+            # Each rank now holds a slice, so the TE can no longer use DLO
+            # AllGather (which requires identical loader-produced weights).
+            self._offload_plan = dataclasses.replace(
+                self._offload_plan, encoder_dlo_weight_replication=frozenset()
+            )
+
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
                 model_or_path=od_config.model,
@@ -244,6 +277,11 @@ class MOSSImagePipeline(nn.Module, SkipLayerGuidanceMixin, DiffusionPipelineProf
                 revision=od_config.revision,
                 torch_dtype=torch.float32,
             )
+        if self.text_encoder_tp_size > 1:
+            # In-place layer slice while still on CPU; the unused half (and
+            # the unused vision tower) is dropped before the .to() below, so
+            # it never reaches the GPU.
+            slice_text_encoder_for_tp(self.text_encoder, self._te_rank, self.text_encoder_tp_size)
         self.text_encoder = self.text_encoder.to(encoder_device)
         self.text_encoder.eval()
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -321,8 +359,20 @@ class MOSSImagePipeline(nn.Module, SkipLayerGuidanceMixin, DiffusionPipelineProf
             inputs = self.tokenizer(formatted, return_tensors="pt", truncation=True, max_length=max_sequence_length).to(
                 self.device
             )
-            output = self.text_encoder(**inputs, use_cache=False, return_dict=True)
-            rows.append(output.last_hidden_state[0])
+            if self.text_encoder_tp_size > 1:
+                # Every rank tokenizes the identical prompt, so the slice
+                # handoff broadcasts need no shape handshake.
+                hidden = text_encoder_tp_forward(
+                    self.text_encoder.language_model,
+                    inputs["input_ids"],
+                    inputs["attention_mask"],
+                    rank=self._te_rank,
+                    tp_size=self.text_encoder_tp_size,
+                    device_group=self._te_device_group,
+                )
+            else:
+                hidden = self.text_encoder(**inputs, use_cache=False, return_dict=True).last_hidden_state
+            rows.append(hidden[0])
         length = max(row.shape[0] for row in rows)
         embeds = rows[0].new_zeros(len(rows), length, rows[0].shape[-1])
         mask = torch.zeros(len(rows), length, device=embeds.device, dtype=torch.bool)
