@@ -23,11 +23,16 @@ ported from the training repository's finalized standalone pipeline
 Parallelism: tensor parallelism (QKV/FFN sharding), CFG parallelism
 (CFGParallelMixin), and Ulysses sequence parallelism (_sp_plan) are
 supported. Ring attention and TeaCache / Cache-DiT are not (ring attention
-cannot express the joint key-padding mask).
+cannot express the joint key-padding mask). With ``text_encoder_tp_size``
+equal to the DiT TP size, the Qwen3.5 text encoder is megatron-sharded over
+the same TP ranks via the checkpoint's HF ``tp_plan`` (encoder_vllm_tp.py);
+the sharded encoder is not weight-replicated, so DLO AllGather is rejected
+for it in that mode (use rank-local transfer).
 """
 
 from __future__ import annotations
 
+import dataclasses
 import math
 import os
 from collections.abc import Iterable, Iterator, Sequence
@@ -45,6 +50,7 @@ from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers import AutoModel, AutoTokenizer
+from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -61,6 +67,7 @@ from vllm_omni.diffusion.model_loader.hub_prefetch import (
     prefetch_subfolders,
 )
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
+from vllm_omni.diffusion.models.mossimage.encoder_vllm_tp import shard_text_encoder_megatron_tp
 from vllm_omni.diffusion.models.mossimage.mossimage_transformer import MOSSImageTransformer
 from vllm_omni.diffusion.offloader.config import TEXT_ENCODER_COMPONENT, resolve_offload
 from vllm_omni.diffusion.offloader.offload_plan import OffloadPlan
@@ -184,6 +191,27 @@ class MOSSImagePipeline(nn.Module, SkipLayerGuidanceMixin, DiffusionPipelineProf
         self.parallel_config = od_config.parallel_config
         self._raise_on_unsupported_features(od_config)
 
+        # Megatron-style text-encoder TP via the checkpoint's HF tp_plan (see
+        # encoder_vllm_tp.py). The collectives ride the vLLM TP group, which
+        # vllm-omni binds to the DiT TP group, so the encoder can only shard
+        # over the DiT TP size.
+        self.text_encoder_tp_size = int(getattr(self.parallel_config, "text_encoder_tp_size", 1) or 1)
+        self._te_rank = 0
+        if self.text_encoder_tp_size > 1:
+            dit_tp_size = get_tensor_model_parallel_world_size()
+            if self.text_encoder_tp_size != dit_tp_size:
+                raise ValueError(
+                    "MOSS-Image shards the text encoder over the vLLM TP group: "
+                    f"text_encoder_tp_size ({self.text_encoder_tp_size}) must be 1 or equal "
+                    f"the DiT tensor-parallel size ({dit_tp_size})."
+                )
+            self._te_rank = get_tensor_model_parallel_rank()
+            # Each rank now holds a shard, so the TE can no longer use DLO
+            # AllGather (which requires identical loader-produced weights).
+            self._offload_plan = dataclasses.replace(
+                self._offload_plan, encoder_dlo_weight_replication=frozenset()
+            )
+
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
                 model_or_path=od_config.model,
@@ -244,6 +272,13 @@ class MOSSImagePipeline(nn.Module, SkipLayerGuidanceMixin, DiffusionPipelineProf
                 revision=od_config.revision,
                 torch_dtype=torch.float32,
             )
+            if self.text_encoder_tp_size > 1:
+                # Swap every tp_plan-covered Linear for its vLLM parallel class
+                # and copy this rank's shard in, all on CPU, so the dropped
+                # half of the weights never reaches the GPU.
+                shard_text_encoder_megatron_tp(
+                    self.text_encoder, self._te_rank, self.text_encoder_tp_size
+                )
         self.text_encoder = self.text_encoder.to(encoder_device)
         self.text_encoder.eval()
         self.tokenizer = AutoTokenizer.from_pretrained(
