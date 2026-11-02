@@ -217,15 +217,34 @@ class MOSSImagePipeline(nn.Module, SkipLayerGuidanceMixin, DiffusionPipelineProf
         encoder_device = (
             torch.device("cpu") if resolve_offload(od_config).offloads(TEXT_ENCODER_COMPONENT) else self.device
         )
-        self.text_encoder = from_pretrained_with_prefetch(
-            AutoModel.from_pretrained,
-            model,
-            subfolder="text_encoder",
-            prefetch_list=mossimage_subfolders,
-            local_files_only=local_files_only,
-            revision=od_config.revision,
-            dtype=text_dtype,
-        ).to(encoder_device)
+        # Stage HF component loads on CPU even when the loader wraps pipeline
+        # construction in a default-device (CUDA) context: safetensors would
+        # otherwise take a direct-to-GPU fast path (the hazard
+        # DiffusersPipelineLoader._init_from_load_format documents for custom
+        # pipelines), and a large encoder OOMs small GPUs before any offload
+        # hook exists. The explicit .to() afterwards goes through the caching
+        # allocator and stays CuMemAllocator-visible.
+        with torch.device("cpu"):
+            self.text_encoder = from_pretrained_with_prefetch(
+                AutoModel.from_pretrained,
+                model,
+                subfolder="text_encoder",
+                prefetch_list=mossimage_subfolders,
+                local_files_only=local_files_only,
+                revision=od_config.revision,
+                dtype=text_dtype,
+            )
+            # FLUX.2-klein VAE; fp32 decode is part of the release precision contract.
+            self.vae = from_pretrained_with_prefetch(
+                AutoencoderKLFlux2.from_pretrained,
+                model,
+                subfolder="vae",
+                prefetch_list=mossimage_subfolders,
+                local_files_only=local_files_only,
+                revision=od_config.revision,
+                torch_dtype=torch.float32,
+            )
+        self.text_encoder = self.text_encoder.to(encoder_device)
         self.text_encoder.eval()
         self.tokenizer = AutoTokenizer.from_pretrained(
             model,
@@ -234,16 +253,7 @@ class MOSSImagePipeline(nn.Module, SkipLayerGuidanceMixin, DiffusionPipelineProf
             revision=od_config.revision,
         )
 
-        # FLUX.2-klein VAE; fp32 decode is part of the release precision contract.
-        self.vae = from_pretrained_with_prefetch(
-            AutoencoderKLFlux2.from_pretrained,
-            model,
-            subfolder="vae",
-            prefetch_list=mossimage_subfolders,
-            local_files_only=local_files_only,
-            revision=od_config.revision,
-            torch_dtype=torch.float32,
-        ).to(self.device)
+        self.vae = self.vae.to(self.device)
         self.vae.eval()
 
         transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, MOSSImageTransformer)
