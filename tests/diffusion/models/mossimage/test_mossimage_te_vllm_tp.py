@@ -186,6 +186,33 @@ def test_megatron_shard_rejects_uncovered_linear(monkeypatch: pytest.MonkeyPatch
         apply_text_encoder_tp_plan(model)
 
 
+def test_streamed_shard_leaves_no_full_size_copy(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Streaming into the rank slice must not retain any full-size checkpoint tensor."""
+    import gc
+
+    _mock_tp(monkeypatch, size=2, rank=0)
+    reference = _tiny_text_model()
+    checkpoint = tmp_path / "text_encoder.safetensors"
+    _write_checkpoint(reference, checkpoint)
+    full_numel = reference.language_model.layers[0].linear_attn.in_proj_qkv.weight.numel()
+
+    probe = _make_probe(te_tp_size=2)
+    probe.text_encoder = probe._init_text_encoder(_tiny_config(), torch.float32)
+    # Only half of the streamed tensor is kept.
+    assert probe.text_encoder.language_model.layers[0].linear_attn.in_proj_qkv.weight.numel() == full_numel // 2
+
+    gc.collect()
+    before = {id(t) for t in gc.get_objects() if isinstance(t, torch.Tensor)}
+    probe.load_weights(_iter_checkpoint(checkpoint, "text_encoder."))
+    gc.collect()
+    leaked = [
+        tuple(t.shape)
+        for t in gc.get_objects()
+        if isinstance(t, torch.Tensor) and id(t) not in before and t.numel() == full_numel
+    ]
+    assert leaked == []
+
+
 # ── pipeline integration ──
 
 

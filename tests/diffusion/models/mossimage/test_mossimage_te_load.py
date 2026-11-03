@@ -121,6 +121,10 @@ def test_text_encoder_is_a_cpu_skeleton_and_vae_stays_on_pretrained(monkeypatch:
     assert pipeline.text_encoder_tp_size == 1
     te_source = pipeline.weights_sources[1]
     assert te_source.subfolder == "text_encoder" and te_source.prefix == "text_encoder."
+    # Both big components must stream one tensor at a time: the multi-thread
+    # loader reads whole shard files (num_weight_load_threads at a time) into
+    # host RAM, which is several times the component size on every rank.
+    assert all(source.streaming_load for source in pipeline.weights_sources)
 
     # With no offload selected the VAE moved to the pipeline device (CPU here).
     assert next(pipeline.vae.parameters()).device.type == "cpu"
@@ -131,3 +135,66 @@ def test_text_encoder_dtype_defaults_to_bf16(monkeypatch: pytest.MonkeyPatch) ->
     with torch.device("meta"):
         pipeline = _build_pipeline(monkeypatch, recorder)
     assert next(pipeline.text_encoder.parameters()).dtype == torch.bfloat16
+
+
+def test_streaming_sources_bypass_multithread_shard_loader(monkeypatch: pytest.MonkeyPatch) -> None:
+    """streaming_load sources must use the lazy per-tensor safetensors iterator.
+
+    The default multi-thread path loads whole shard files into host RAM,
+    ``num_weight_load_threads`` at a time — for the ~15.6 GiB bf16 text encoder
+    that is a full-size host copy per rank, which OOMs small-RAM multi-GPU
+    nodes. Default (non-streaming) sources must keep the multi-thread path.
+    """
+    from types import SimpleNamespace
+
+    from vllm_omni.diffusion.model_loader import diffusers_loader as loader_mod
+    from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+
+    load_config = SimpleNamespace(
+        use_tqdm_on_load=False,
+        safetensors_load_strategy=None,
+        download_dir=None,
+    )
+    od_config = SimpleNamespace(
+        quantization_config=None,
+        parallel_config=SimpleNamespace(),
+        enable_multithread_weight_load=True,
+        num_weight_load_threads=4,
+    )
+    loader = DiffusersPipelineLoader(load_config, od_config)
+    loader.counter_before_loading_weights = 0.0
+    files = ["/w/model-00001-of-00002.safetensors", "/w/model-00002-of-00002.safetensors"]
+    monkeypatch.setattr(loader, "_prepare_weights", lambda *a, **k: ("/w", files, True))
+
+    calls: dict[str, list] = {"multi": [], "single": []}
+
+    def fake_multi(files_, *_args, **_kwargs):
+        calls["multi"].append(list(files_))
+        return iter([("w", torch.zeros(1))])
+
+    def fake_single(files_, *_args, **_kwargs):
+        calls["single"].append(list(files_))
+        return iter([("w", torch.zeros(1))])
+
+    monkeypatch.setattr(loader_mod, "multi_thread_safetensors_weights_iterator", fake_multi)
+    monkeypatch.setattr(loader_mod, "safetensors_weights_iterator", fake_single)
+
+    streaming = DiffusersPipelineLoader.ComponentSource(
+        model_or_path="/w",
+        subfolder=None,
+        revision=None,
+        prefix="transformer.",
+        streaming_load=True,
+    )
+    list(loader._get_weights_iterator(streaming))
+    assert calls["single"] == [files]
+    assert calls["multi"] == []
+
+    default = DiffusersPipelineLoader.ComponentSource(
+        model_or_path="/w",
+        subfolder=None,
+        revision=None,
+        prefix="transformer.",
+    )
+    list(loader._get_weights_iterator(default))
+    assert calls["multi"] == [files]  # default behavior unchanged

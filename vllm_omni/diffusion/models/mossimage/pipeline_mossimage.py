@@ -216,6 +216,11 @@ class MOSSImagePipeline(nn.Module, SkipLayerGuidanceMixin, DiffusionPipelineProf
                 self._offload_plan, encoder_dlo_weight_replication=frozenset()
             )
 
+        # Both big components stream their safetensors one tensor at a time
+        # (streaming_load): the default multi-thread loader would otherwise
+        # read whole ~4-5 GiB shard files into host RAM, up to
+        # num_weight_load_threads at once, on every rank — several times the
+        # size of the component itself, which OOMs small-RAM multi-GPU nodes.
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
                 model_or_path=od_config.model,
@@ -223,6 +228,7 @@ class MOSSImagePipeline(nn.Module, SkipLayerGuidanceMixin, DiffusionPipelineProf
                 revision=od_config.revision,
                 prefix="transformer.",
                 fall_back_to_pt=True,
+                streaming_load=True,
             ),
             # The text encoder streams its weights through the loader too:
             # safetensors tensors are read one at a time and narrowed into
@@ -234,6 +240,7 @@ class MOSSImagePipeline(nn.Module, SkipLayerGuidanceMixin, DiffusionPipelineProf
                 revision=od_config.revision,
                 prefix="text_encoder.",
                 fall_back_to_pt=True,
+                streaming_load=True,
             ),
         ]
 

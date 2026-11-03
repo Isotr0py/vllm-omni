@@ -208,6 +208,12 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         weight_name_patterns: tuple[str, ...] | None = None
         """Optional tensor-name globs applied before safetensor materialization."""
 
+        streaming_load: bool = False
+        """Stream safetensors one tensor at a time (single-threaded) instead of
+        loading whole shard files with a thread pool. Bounds the host-RAM
+        transient to a single tensor, which matters for large components
+        (multi-GiB text encoders / DiTs) on small-RAM multi-GPU nodes."""
+
     counter_before_loading_weights: float = 0.0
     counter_after_loading_weights: float = 0.0
 
@@ -390,6 +396,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         quant_config = self._get_source_quant_config(source)
         use_multithread = (
             use_safetensors
+            and not source.streaming_load
             and source.weight_name_patterns is None
             and getattr(self.od_config, "enable_multithread_weight_load", False)
             and self.load_config.safetensors_load_strategy != "torchao"
