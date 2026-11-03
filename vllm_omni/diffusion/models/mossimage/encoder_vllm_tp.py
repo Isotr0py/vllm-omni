@@ -21,8 +21,8 @@ hidden state.
 from __future__ import annotations
 
 import re
+from typing import Any
 
-import torch
 from torch import nn
 
 from vllm_omni.diffusion.models.utils import replace_linear_class
@@ -43,13 +43,18 @@ _STYLES = {
 _SKIPPED_STYLES = {"replicated_with_grad_allreduce", "local", "gather", "local_packed_rowwise"}
 
 
-def apply_text_encoder_tp_plan(text_encoder: nn.Module) -> None:
+def apply_text_encoder_tp_plan(text_encoder: nn.Module, quant_config: Any | None = None) -> None:
     """Swap tp_plan-covered linears of ``text_encoder`` for vLLM parallel classes.
 
     The checkpoint's ``visual`` tower (unused by this text-only pipeline) is
     dropped.  Any ``nn.Linear`` under the language model that the plan does
     not cover raises instead of silently staying replicated — keeping a large
     projection full-size would defeat the point.
+
+    With ``quant_config`` the replacement linears carry a quant method (online
+    weight-only quantization): each layer's shard loads through the method's
+    lazy weight loader and quantizes in place as soon as its weights finish
+    streaming in — shard first, quantize second, never a full-size host copy.
     """
     tp_plan = getattr(text_encoder, "tp_plan", None) or {}
     if not tp_plan:
@@ -74,7 +79,7 @@ def apply_text_encoder_tp_plan(text_encoder: nn.Module) -> None:
                 setattr(
                     module,
                     child_name,
-                    replace_linear_class(child, _STYLES[style], prefix=qual_name),
+                    replace_linear_class(child, _STYLES[style], quant_config, prefix=qual_name),
                 )
             else:
                 _recursive_replace(child, qual_name)

@@ -90,11 +90,14 @@ def _mock_tp(monkeypatch: pytest.MonkeyPatch, size: int, rank: int) -> None:
 
 
 def _make_probe(te_tp_size: int) -> MOSSImagePipeline:
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+
     pipeline = MOSSImagePipeline.__new__(MOSSImagePipeline)
     nn.Module.__init__(pipeline)
     pipeline.text_encoder_tp_size = te_tp_size
     pipeline._text_encoder_device = torch.device("cpu")
     pipeline.transformer = nn.Linear(2, 2)
+    pipeline.od_config = OmniDiffusionConfig(model="moss-image")
     return pipeline
 
 

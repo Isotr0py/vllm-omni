@@ -33,6 +33,12 @@ VAE memory: ``--vae-use-slicing`` / ``--vae-use-tiling`` enable diffusers'
 sliced/tiled fp32 decode, and ``--vae-patch-parallel-size`` > 1 wraps
 ``vae.decode`` with the distributed tile/patch decoder over the TP group
 (vae_patch_parallel.py).
+
+Text-encoder quantization: route ``{"text_encoder": {"method":
+"bitsandbytes", "quant_type": "nf4"}}`` through ``--diffusion-quantization-config``
+for bnb nf4/fp4 weight-only quantization (sm75+; vLLM ``int8`` is accepted
+too but needs sm80+). Shards quantize in place as their weights stream in;
+the text encoder cannot be CPU-offloaded (DLO) while quantized.
 """
 
 from __future__ import annotations
@@ -368,18 +374,53 @@ class MOSSImagePipeline(nn.Module, SkipLayerGuidanceMixin, DiffusionPipelineProf
         the full ~15.6 GiB bf16 encoder in host RAM on every rank (twice over
         with the fp16 cast in flight) before any sharding could drop half of
         it, which OOMs the host on small-RAM multi-GPU nodes.
+
+        With a quantization config routed at the ``text_encoder`` component
+        (bnb nf4/fp4, or vLLM int8 on sm80+), every tp_plan-covered linear is
+        built with a quant method: shards stay on meta until their weights
+        stream in, then quantize in place per layer (shard first, quantize
+        second). Embeddings and norms are never quantized.
         """
+        te_quant = self._text_encoder_quant_config()
         with torch.device("cpu"):
             with init_on_device_without_buffers(torch.device("meta")):
                 text_encoder = AutoModel.from_config(text_config, dtype=text_dtype)
             if getattr(text_encoder, "visual", None) is not None:
                 # Text-only pipeline: the vision tower is never called.
                 del text_encoder.visual
-            if self.text_encoder_tp_size > 1:
-                apply_text_encoder_tp_plan(text_encoder)
+            if self.text_encoder_tp_size > 1 or te_quant is not None:
+                apply_text_encoder_tp_plan(text_encoder, quant_config=te_quant)
             init_parameters_preserving_vllm_linear(text_encoder, dtype=text_dtype, device=torch.device("cpu"))
         text_encoder.eval()
         return text_encoder
+
+    def _text_encoder_quant_config(self) -> Any | None:
+        """Resolve and validate a quantization config routed at ``text_encoder``.
+
+        Only online weight-only methods work with the CPU-staged streaming
+        load: bnb nf4/fp4 (sm75+) and vLLM int8 (sm80+). Quantized weights are
+        only well-formed after their on-device quantization step, so TE CPU
+        offload (DLO/layerwise storage relocation) is rejected outright.
+        """
+        from vllm_omni.quantization.component_config import resolve_component_quant_config
+
+        quant_config = resolve_component_quant_config(self.od_config.quantization_config, "text_encoder")
+        if quant_config is None:
+            return None
+        if quant_config.get_name() not in ("bitsandbytes", "int8"):
+            raise ValueError(
+                "MOSS-Image text encoder supports only online weight-only quantization "
+                "('bitsandbytes' nf4/fp4, or 'int8' on sm80+); "
+                f"got {quant_config.get_name()!r}."
+            )
+        if resolve_offload(self.od_config).offloads(TEXT_ENCODER_COMPONENT):
+            raise ValueError(
+                "text_encoder quantization is incompatible with text_encoder offload: "
+                "DLO/layerwise backends relocate raw storages and would lose the quantized "
+                "side state (e.g. bnb quant_state). Keep components=['dit'] "
+                "(TE stays resident) or drop the text_encoder quantization config."
+            )
+        return quant_config
 
     @contextmanager
     def _dit_residency(self) -> Iterator[None]:

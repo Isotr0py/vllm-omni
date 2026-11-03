@@ -559,8 +559,15 @@ class Int8OnlineLinearMethod(LazyWeightMixin, Int8LinearMethod):
             layer.register_parameter("weight", weight)
             initialize_single_dummy_weight(layer.weight)
 
+        # The int8 quant op is CUDA-only; CPU-staged weights (e.g. encoders
+        # whose host skeleton streams in on CPU before moving to the device)
+        # must visit the accelerator first. Weights already on the device —
+        # the ordinary DiT online-quant flow — are unaffected.
+        weight = layer.weight.data.contiguous()
+        if not weight.is_cuda:
+            weight = weight.cuda()
         w_q_name, w_s_name, i_s_name, i_zp_name, azp_adj_name = self.int8_linear.layer_param_names
-        qweight, weight_scale, _ = ops.scaled_int8_quant(layer.weight, scale=None)
+        qweight, weight_scale, _ = ops.scaled_int8_quant(weight, scale=None)
 
         # Update layer with new values.
         replace_parameter(layer, w_q_name, torch.nn.Parameter(qweight.t().data, requires_grad=False))
