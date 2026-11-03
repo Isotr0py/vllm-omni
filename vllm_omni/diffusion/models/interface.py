@@ -102,9 +102,11 @@ class SupportsStepExecution(Protocol):
 
     Pipelines may also implement the optional ``decode_preview(latents,
     max_side) -> str | None`` hook: a cheap downscaled JPEG (b64) of in-flight
-    latents for SSE preview streaming. The runner calls it only for opted-in
-    requests (``extra_args["stream_progress"]``), on the primary rank, and
-    treats every failure as non-fatal.
+    latents for SSE preview streaming. The runner calls it for opted-in
+    requests (``extra_args["stream_progress"]``) on EVERY rank — the decode
+    may carry TP-group collectives (patch-parallel VAE), so all ranks must
+    participate; non-primary ranks discard the result. Every failure is
+    treated as non-fatal.
     """
 
     supports_step_execution: ClassVar[bool] = True

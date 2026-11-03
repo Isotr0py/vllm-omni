@@ -537,8 +537,10 @@ class MOSSImagePipeline(nn.Module, SkipLayerGuidanceMixin, DiffusionPipelineProf
         preview runs the real decoder on an average-pooled latent grid sized
         for ``max_side`` pixels (e.g. a 1024px request decodes a 16x16 packed
         latent -> 256px image, ~1/16 of the full decode's cost). Only the
-        first image of the batch is previewed. Any failure is swallowed by the
-        caller (previews are strictly best-effort).
+        first image of the batch is previewed. The runner calls this on every
+        TP rank (non-primary results are discarded): with VAE patch
+        parallelism the decode carries TP-group collectives, so all ranks must
+        participate or the group deadlocks.
         """
         import base64
         import io

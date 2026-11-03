@@ -31,13 +31,18 @@ def build_progress_output(
     """Build a non-terminal progress/preview chunk, or None when not requested.
 
     Emitted only when the request opted in via ``extra_args["stream_progress"]``
-    (the API layer sets it for ``stream=true`` image requests) and only on the
-    primary rank. Preview decode is delegated to the pipeline's optional
-    ``decode_preview`` hook; preview failures never fail the request.
+    (the API layer sets it for ``stream=true`` image requests); the chunk is
+    attached only on the primary rank.
+
+    Preview decode runs on EVERY rank, not just the primary: latents are
+    replicated across TP ranks, and ``vae.decode`` may carry TP-group
+    collectives (the patch-parallel wrapper broadcasts on every call), so a
+    primary-only decode would deadlock the group. Non-primary ranks discard
+    the decoded preview. Preview failures never fail the request.
     """
-    if not extra_args.get("stream_progress") or not is_primary:
+    if not extra_args.get("stream_progress"):
         return None
-    custom_output: dict[str, Any] = {"progress": {"step": step_index, "total": total}}
+    preview_b64: str | None = None
     preview_interval = int(extra_args.get("preview_interval", 0) or 0)
     if preview_interval > 0 and step_index % preview_interval == 0 and latents is not None:
         decode_preview = getattr(pipeline, "decode_preview", None)
@@ -47,8 +52,12 @@ def build_progress_output(
                     latents,
                     max_side=int(extra_args.get("preview_max_side", 256) or 256),
                 )
-                if preview_b64:
-                    custom_output["preview_b64"] = preview_b64
             except Exception:
                 logger.warning("Preview decode failed for request %s", request_id, exc_info=True)
+                preview_b64 = None
+    if not is_primary:
+        return None
+    custom_output: dict[str, Any] = {"progress": {"step": step_index, "total": total}}
+    if preview_b64:
+        custom_output["preview_b64"] = preview_b64
     return DiffusionOutput(output=None, finished=False, custom_output=custom_output)

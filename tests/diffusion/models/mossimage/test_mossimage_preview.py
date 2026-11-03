@@ -3,15 +3,21 @@
 
 """Tests for MOSS-Image denoise progress/preview outputs (SSE streaming).
 
-Covers the runner-side gating (``_maybe_build_progress_output``: opt-in via
-extra_args, primary-rank only, preview cadence, preview failures non-fatal)
-and the pipeline's cheap downscaled latent decode (``decode_preview``).
+Covers the runner-side gating (``build_progress_output``: opt-in via
+extra_args, chunk attached on the primary rank, preview decode on EVERY rank
+so patch-parallel VAE collectives stay in lockstep, preview cadence, preview
+failures non-fatal) and the pipeline's cheap downscaled latent decode
+(``decode_preview``).
 """
 
 from __future__ import annotations
 
 import base64
 import io
+import os
+import subprocess
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -22,6 +28,8 @@ from torch import nn
 from vllm_omni.diffusion.models.mossimage.pipeline_mossimage import MOSSImagePipeline
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
+
+_LOCKSTEP_WORKER = Path(__file__).with_name("preview_lockstep_dist_worker.py")
 
 
 class _PreviewVAE(nn.Module):
@@ -91,8 +99,13 @@ def test_progress_output_opt_in_and_primary_only() -> None:
 
     # Not requested -> nothing.
     assert _progress(pipeline, {}) is None
-    # Non-primary rank -> nothing.
-    assert _progress(pipeline, {"stream_progress": True}, is_primary=False) is None
+    # Non-primary rank -> no chunk, but the decode still runs on it: the
+    # decode may carry TP-group collectives (patch-parallel VAE), so every
+    # rank must call it or the group deadlocks.
+    calls = []
+    pipeline.decode_preview = lambda latents, max_side=256: calls.append(1) or "qux"
+    assert _progress(pipeline, {"stream_progress": True, "preview_interval": 1}, is_primary=False) is None
+    assert len(calls) == 1
 
     output = _progress(pipeline, {"stream_progress": True})
     assert output is not None and output.finished is False and output.output is None
@@ -123,3 +136,34 @@ def test_preview_failure_is_not_fatal() -> None:
     assert output is not None
     assert output.custom_output["progress"] == {"step": 5, "total": 50}
     assert "preview_b64" not in output.custom_output
+
+
+@pytest.mark.skipif(not _LOCKSTEP_WORKER.is_file(), reason="dist worker helper missing")
+def test_preview_decode_participates_on_all_ranks(tmp_path: Path) -> None:
+    """Two gloo ranks: a collectives-bearing decode_preview must not deadlock.
+
+    Regression for the T4x2 hang: a primary-only preview decode hits the
+    patch-parallel VAE wrapper's TP-group broadcast on rank 0 while rank 1
+    waits for the next step — a permanent NCCL deadlock (GPU0 spinning, GPU1
+    idle). The fix runs the decode on every rank and attaches the result only
+    on the primary.
+    """
+    import vllm_omni
+
+    repo_root = str(Path(vllm_omni.__path__[0]).resolve().parent)
+    env = {**os.environ, "PREVIEW_TP_STORE": str(tmp_path / "gloo_store")}
+    workers = []
+    for rank in (0, 1):
+        workers.append(
+            subprocess.Popen(
+                [sys.executable, str(_LOCKSTEP_WORKER), str(rank), repo_root],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+        )
+    for rank, worker in enumerate(workers):
+        out, _ = worker.communicate(timeout=90)
+        assert worker.returncode == 0, f"rank {rank} failed:\n{out[-2000:]}"
+        assert "PREVIEW_LOCKSTEP_DIST_OK" in out, out[-2000:]
