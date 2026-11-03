@@ -3,10 +3,10 @@
 
 """Child-process worker for test_te_megatron_tp_forward_gloo_two_ranks.
 
-Not a pytest module: spawned by the test with argv = [rank, repo_root].
-Each rank builds the identical tiny Qwen3.5 (same seed), checks the
-megatron-sharded forward against its own full-forward reference, and prints
-TE_MEGATRON_TP_DIST_OK on success.
+Not a pytest module: spawned by the test with argv = [rank, repo_root] and
+TE_TP_CHECKPOINT / TE_TP_STORE in the environment. Each rank loads the full
+checkpoint as reference, then builds the loader-fed TP-sharded skeleton and
+compares the forward outputs. Prints TE_MEGATRON_TP_DIST_OK on success.
 
 When no real vllm is installed (local CPU dev box), the OMNI_STUB_SHIM env
 var points at a shim file that installs faithful stub TP linears; CI runs
@@ -29,29 +29,21 @@ if _SHIM:
     omni_stub_env.install()
 
 
-def _load_encoder_vllm_tp(repo_root: str):
-    path = Path(repo_root) / "vllm_omni/diffusion/models/mossimage/encoder_vllm_tp.py"
-    spec = importlib.util.spec_from_file_location("mossimage_encoder_vllm_tp", path)
+def _load_module(repo_root: str, relative: str, name: str):
+    path = Path(repo_root) / relative
+    spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-def main() -> None:
-    rank = int(sys.argv[1])
-    repo_root = sys.argv[2]
-    dist.init_process_group("gloo", init_method=f"file://{os.environ['TE_TP_STORE']}", rank=rank, world_size=2)
-
+def _tiny_config():
     from transformers.models.qwen3_5.configuration_qwen3_5 import (
         Qwen3_5Config,
         Qwen3_5TextConfig,
         Qwen3_5VisionConfig,
     )
-    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5Model
 
-    encoder_vllm_tp = _load_encoder_vllm_tp(repo_root)
-
-    torch.manual_seed(0)
     text_cfg = Qwen3_5TextConfig(
         vocab_size=256,
         hidden_size=64,
@@ -68,20 +60,62 @@ def main() -> None:
         max_position_embeddings=128,
     )
     vision_cfg = Qwen3_5VisionConfig(hidden_size=32, depth=2, num_heads=2, out_hidden_size=64)
-    model = Qwen3_5Model(Qwen3_5Config(text_config=text_cfg.to_dict(), vision_config=vision_cfg.to_dict())).eval()
+    return Qwen3_5Config(text_config=text_cfg.to_dict(), vision_config=vision_cfg.to_dict())
 
-    torch.manual_seed(1)
-    input_ids = torch.randint(0, 256, (2, 11))
+
+def _iter_checkpoint(path: str, prefix: str):
+    from safetensors import safe_open
+
+    with safe_open(path, framework="pt") as f:
+        for key in f.keys():
+            yield prefix + key, f.get_tensor(key)
+
+
+def main() -> None:
+    rank = int(sys.argv[1])
+    repo_root = sys.argv[2]
+    checkpoint = os.environ["TE_TP_CHECKPOINT"]
+    dist.init_process_group("gloo", init_method=f"file://{os.environ['TE_TP_STORE']}", rank=rank, world_size=2)
+
+    from transformers import AutoConfig, AutoModel
+    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5Model
+
+    from vllm.model_executor.models.utils import AutoWeightsLoader
+    from vllm_omni.diffusion.models import utils as omni_model_utils
+
+    encoder_vllm_tp = _load_module(
+        repo_root, "vllm_omni/diffusion/models/mossimage/encoder_vllm_tp.py", "mossimage_encoder_vllm_tp"
+    )
+
+    input_ids = torch.tensor([[3, 17, 42, 99, 7, 200, 11, 5, 6, 8, 13], [1, 2, 3, 4, 5, 6, 7, 0, 0, 0, 0]])
     attention_mask = torch.ones(2, 11, dtype=torch.long)
     attention_mask[1, 7:] = 0
 
-    with torch.no_grad():
-        expected = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).last_hidden_state
+    # Reference: full model, plain load.
+    from safetensors.torch import load_file
 
-    encoder_vllm_tp.shard_text_encoder_megatron_tp(model, rank, 2)
+    reference = Qwen3_5Model(_tiny_config()).eval()
+    reference.load_state_dict(load_file(checkpoint))
     with torch.no_grad():
-        # Megatron TP needs no special forward: the parallel linears carry
-        # the collectives, so the plain HF call is the TP path.
+        expected = reference(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).last_hidden_state
+
+    # Sharded: skeleton -> plan -> lazy feed, mirroring the pipeline.
+    config = _tiny_config()
+    with torch.device("cpu"):
+        with omni_model_utils.init_on_device_without_buffers(torch.device("meta")):
+            model = AutoModel.from_config(config, dtype=torch.float32)
+        del model.visual
+        encoder_vllm_tp.apply_text_encoder_tp_plan(model)
+        omni_model_utils.init_parameters_preserving_vllm_linear(model, dtype=torch.float32, device=torch.device("cpu"))
+    model.eval()
+
+    root = torch.nn.Module()
+    root.text_encoder = model
+    AutoWeightsLoader(root, ignore_unexpected_prefixes=["text_encoder.visual."]).load_weights(
+        _iter_checkpoint(checkpoint, "text_encoder.")
+    )
+
+    with torch.no_grad():
         actual = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).last_hidden_state
 
     # Sharded GEMMs may differ from the full-width ones by float reassociation.

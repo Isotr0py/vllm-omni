@@ -1,14 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Regression test: MOSS-Image HF components must stage on CPU during load.
+"""Regression test: MOSS-Image HF components must not load straight to GPU,
+and the text encoder must never materialize a full-size host copy.
 
 The diffusion loader constructs the pipeline under a default-device context
 (``with torch.device(target_device):``). Under that context HF
-``from_pretrained`` takes a direct-to-GPU fast path, so the Qwen3.5 text
-encoder (~15.6 GiB bf16) used to materialize straight onto the GPU and OOM
-small cards before any offload hook existed. The pipeline now forces a CPU
-context around those loads and moves explicitly afterwards.
+``from_pretrained`` takes a direct-to-GPU fast path, which OOMed small cards
+(T4) at load time. Two-stage fix:
+
+1. The text encoder is built as an empty CPU skeleton (``AutoConfig`` +
+   ``AutoModel.from_config`` under a meta/CPU context); its weights stream in
+   through the loader's lazily-iterated safetensors path, straight into the
+   (possibly TP-sharded) params, and ``load_weights`` moves the module to its
+   runtime device afterwards.
+2. The VAE keeps the from_pretrained path but is staged under an explicit CPU
+   context and moved afterwards.
 """
 
 from __future__ import annotations
@@ -21,6 +28,32 @@ from vllm_omni.diffusion.models.mossimage import pipeline_mossimage as pipeline_
 from vllm_omni.diffusion.models.mossimage.pipeline_mossimage import MOSSImagePipeline
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
+
+
+def _tiny_config():
+    from transformers.models.qwen3_5.configuration_qwen3_5 import (
+        Qwen3_5Config,
+        Qwen3_5TextConfig,
+        Qwen3_5VisionConfig,
+    )
+
+    text_cfg = Qwen3_5TextConfig(
+        vocab_size=256,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=32,
+        linear_key_head_dim=16,
+        linear_value_head_dim=16,
+        linear_num_key_heads=2,
+        linear_num_value_heads=4,
+        full_attention_interval=2,
+        max_position_embeddings=128,
+    )
+    vision_cfg = Qwen3_5VisionConfig(hidden_size=32, depth=1, num_heads=2, out_hidden_size=64)
+    return Qwen3_5Config(text_config=text_cfg.to_dict(), vision_config=vision_cfg.to_dict())
 
 
 class _DummyTransformer(nn.Module):
@@ -36,7 +69,6 @@ class _FactoryRecorder:
         self.calls: list[dict] = []
 
     def __call__(self, factory, model, **kwargs):
-        # Allocate through the ambient default device, like HF's loader does.
         probe = torch.empty(0)
         self.calls.append(
             {
@@ -54,6 +86,7 @@ def _build_pipeline(
     from vllm_omni.diffusion.data import OmniDiffusionConfig
 
     monkeypatch.setattr(pipeline_mod, "from_pretrained_with_prefetch", recorder)
+    monkeypatch.setattr(pipeline_mod.AutoConfig, "from_pretrained", lambda *a, **k: _tiny_config())
     monkeypatch.setattr(pipeline_mod, "prefetch_subfolders", lambda *a, **k: None)
     monkeypatch.setattr(pipeline_mod.MOSSImageScheduler, "from_pretrained", lambda *a, **k: object())
     monkeypatch.setattr(pipeline_mod.AutoTokenizer, "from_pretrained", lambda *a, **k: object())
@@ -67,7 +100,7 @@ def _build_pipeline(
     return MOSSImagePipeline(od_config=OmniDiffusionConfig(**kwargs))
 
 
-def test_hf_components_stage_on_cpu_inside_device_context(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_text_encoder_is_a_cpu_skeleton_and_vae_stays_on_pretrained(monkeypatch: pytest.MonkeyPatch) -> None:
     recorder = _FactoryRecorder()
 
     # The diffusion loader constructs the pipeline under the target device
@@ -75,21 +108,26 @@ def test_hf_components_stage_on_cpu_inside_device_context(monkeypatch: pytest.Mo
     with torch.device("meta"):
         pipeline = _build_pipeline(monkeypatch, recorder, dtype=torch.float16)
 
-    assert [call["subfolder"] for call in recorder.calls] == ["text_encoder", "vae"]
-    # Without the fix both loads would record "meta" (CUDA in production).
-    assert all(call["default_device"] == "cpu" for call in recorder.calls)
+    # The text encoder no longer goes through from_pretrained at all: the VAE
+    # is the only from_pretrained_with_prefetch call left, staged on CPU.
+    assert [call["subfolder"] for call in recorder.calls] == ["vae"]
+    assert recorder.calls[0]["default_device"] == "cpu"
+    assert recorder.calls[0]["kwargs"]["torch_dtype"] == torch.float32
 
-    # dtype contract: TE follows od_config.dtype, VAE stays fp32.
-    assert recorder.calls[0]["kwargs"]["dtype"] == torch.float16
-    assert recorder.calls[1]["kwargs"]["torch_dtype"] == torch.float32
+    # TE skeleton: real fp16 CPU params, no weights loaded yet, declared as a
+    # loader source so weights stream in later.
+    param = next(pipeline.text_encoder.parameters())
+    assert param.device.type == "cpu" and param.dtype == torch.float16
+    assert pipeline.text_encoder_tp_size == 1
+    te_source = pipeline.weights_sources[1]
+    assert te_source.subfolder == "text_encoder" and te_source.prefix == "text_encoder."
 
-    # With no offload selected, both end up on the pipeline device (CPU here).
-    assert next(pipeline.text_encoder.parameters()).device.type == "cpu"
+    # With no offload selected the VAE moved to the pipeline device (CPU here).
     assert next(pipeline.vae.parameters()).device.type == "cpu"
 
 
 def test_text_encoder_dtype_defaults_to_bf16(monkeypatch: pytest.MonkeyPatch) -> None:
     recorder = _FactoryRecorder()
     with torch.device("meta"):
-        _build_pipeline(monkeypatch, recorder)
-    assert recorder.calls[0]["kwargs"]["dtype"] == torch.bfloat16
+        pipeline = _build_pipeline(monkeypatch, recorder)
+    assert next(pipeline.text_encoder.parameters()).dtype == torch.bfloat16

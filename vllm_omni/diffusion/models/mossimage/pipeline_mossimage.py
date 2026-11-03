@@ -49,7 +49,7 @@ from diffusers.models.autoencoders.autoencoder_kl_flux2 import AutoencoderKLFlux
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoConfig, AutoModel, AutoTokenizer
 from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
@@ -67,8 +67,12 @@ from vllm_omni.diffusion.model_loader.hub_prefetch import (
     prefetch_subfolders,
 )
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
-from vllm_omni.diffusion.models.mossimage.encoder_vllm_tp import shard_text_encoder_megatron_tp
+from vllm_omni.diffusion.models.mossimage.encoder_vllm_tp import apply_text_encoder_tp_plan
 from vllm_omni.diffusion.models.mossimage.mossimage_transformer import MOSSImageTransformer
+from vllm_omni.diffusion.models.utils import (
+    init_on_device_without_buffers,
+    init_parameters_preserving_vllm_linear,
+)
 from vllm_omni.diffusion.offloader.config import TEXT_ENCODER_COMPONENT, resolve_offload
 from vllm_omni.diffusion.offloader.offload_plan import OffloadPlan
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
@@ -219,7 +223,18 @@ class MOSSImagePipeline(nn.Module, SkipLayerGuidanceMixin, DiffusionPipelineProf
                 revision=od_config.revision,
                 prefix="transformer.",
                 fall_back_to_pt=True,
-            )
+            ),
+            # The text encoder streams its weights through the loader too:
+            # safetensors tensors are read one at a time and narrowed into
+            # the (possibly TP-sharded) params on arrival, so no full-size
+            # host copy of the encoder ever exists.
+            DiffusersPipelineLoader.ComponentSource(
+                model_or_path=od_config.model,
+                subfolder="text_encoder",
+                revision=od_config.revision,
+                prefix="text_encoder.",
+                fall_back_to_pt=True,
+            ),
         ]
 
         self.device = get_local_device()
@@ -242,26 +257,19 @@ class MOSSImagePipeline(nn.Module, SkipLayerGuidanceMixin, DiffusionPipelineProf
 
         # Qwen3.5 base model; bf16 like the standalone release.
         text_dtype = od_config.dtype or torch.bfloat16
-        encoder_device = (
+        self._text_encoder_device = (
             torch.device("cpu") if resolve_offload(od_config).offloads(TEXT_ENCODER_COMPONENT) else self.device
         )
-        # Stage HF component loads on CPU even when the loader wraps pipeline
-        # construction in a default-device (CUDA) context: safetensors would
-        # otherwise take a direct-to-GPU fast path (the hazard
-        # DiffusersPipelineLoader._init_from_load_format documents for custom
-        # pipelines), and a large encoder OOMs small GPUs before any offload
-        # hook exists. The explicit .to() afterwards goes through the caching
-        # allocator and stays CuMemAllocator-visible.
+        text_config = AutoConfig.from_pretrained(
+            model,
+            subfolder="text_encoder",
+            local_files_only=local_files_only,
+            revision=od_config.revision,
+        )
+        self.text_encoder = self._init_text_encoder(text_config, text_dtype)
+        # The VAE has no loader source; keep it on the proven from_pretrained
+        # path, staged on CPU (see _init_text_encoder) and moved explicitly.
         with torch.device("cpu"):
-            self.text_encoder = from_pretrained_with_prefetch(
-                AutoModel.from_pretrained,
-                model,
-                subfolder="text_encoder",
-                prefetch_list=mossimage_subfolders,
-                local_files_only=local_files_only,
-                revision=od_config.revision,
-                dtype=text_dtype,
-            )
             # FLUX.2-klein VAE; fp32 decode is part of the release precision contract.
             self.vae = from_pretrained_with_prefetch(
                 AutoencoderKLFlux2.from_pretrained,
@@ -272,15 +280,6 @@ class MOSSImagePipeline(nn.Module, SkipLayerGuidanceMixin, DiffusionPipelineProf
                 revision=od_config.revision,
                 torch_dtype=torch.float32,
             )
-            if self.text_encoder_tp_size > 1:
-                # Swap every tp_plan-covered Linear for its vLLM parallel class
-                # and copy this rank's shard in, all on CPU, so the dropped
-                # half of the weights never reaches the GPU.
-                shard_text_encoder_megatron_tp(
-                    self.text_encoder, self._te_rank, self.text_encoder_tp_size
-                )
-        self.text_encoder = self.text_encoder.to(encoder_device)
-        self.text_encoder.eval()
         self.tokenizer = AutoTokenizer.from_pretrained(
             model,
             subfolder="tokenizer",
@@ -321,6 +320,28 @@ class MOSSImagePipeline(nn.Module, SkipLayerGuidanceMixin, DiffusionPipelineProf
     # ------------------------------------------------------------------
     # Text encoding
     # ------------------------------------------------------------------
+
+    def _init_text_encoder(self, text_config: Any, text_dtype: torch.dtype) -> nn.Module:
+        """Build the text encoder as an empty CPU skeleton (weights stream in later).
+
+        The loader feeds weights from ``weights_sources`` straight into the —
+        possibly TP-sharded — params (``load_weights`` moves the module to its
+        runtime device afterwards). A from_pretrained load would materialize
+        the full ~15.6 GiB bf16 encoder in host RAM on every rank (twice over
+        with the fp16 cast in flight) before any sharding could drop half of
+        it, which OOMs the host on small-RAM multi-GPU nodes.
+        """
+        with torch.device("cpu"):
+            with init_on_device_without_buffers(torch.device("meta")):
+                text_encoder = AutoModel.from_config(text_config, dtype=text_dtype)
+            if getattr(text_encoder, "visual", None) is not None:
+                # Text-only pipeline: the vision tower is never called.
+                del text_encoder.visual
+            if self.text_encoder_tp_size > 1:
+                apply_text_encoder_tp_plan(text_encoder)
+            init_parameters_preserving_vllm_linear(text_encoder, dtype=text_dtype, device=torch.device("cpu"))
+        text_encoder.eval()
+        return text_encoder
 
     @contextmanager
     def _dit_residency(self) -> Iterator[None]:
@@ -716,5 +737,11 @@ class MOSSImagePipeline(nn.Module, SkipLayerGuidanceMixin, DiffusionPipelineProf
     # ------------------------------------------------------------------
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+        # The vision tower is deleted at construction; its checkpoint keys are
+        # expected-but-unused, not an error.
+        loader = AutoWeightsLoader(self, ignore_unexpected_prefixes=["text_encoder.visual."])
+        loaded = loader.load_weights(weights)
+        # The text encoder skeleton was built on CPU and its weights streamed
+        # into place above; only now does it move to its runtime device.
+        self.text_encoder = self.text_encoder.to(self._text_encoder_device)
+        return loaded

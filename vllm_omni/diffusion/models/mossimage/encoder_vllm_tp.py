@@ -4,21 +4,22 @@
 
 Applies the checkpoint model's own HF ``tp_plan``: every ``nn.Linear`` the
 plan covers is swapped for the matching vLLM parallel linear class
-(``ColumnParallelLinear`` / ``RowParallelLinear`` / ``ReplicatedLinear``) and
-the rank-local weight shard is copied in.  The collectives ride the vLLM TP
-group (which vllm-omni binds to the DiT TP group), so the encoder is sharded
-over exactly the DiT TP ranks and every layer's math is unchanged — full
-attention halves heads per rank, the linear-attention (GDN) projections are
-``colwise_gather_output`` so the recurrence still sees the full hidden state.
+(``ColumnParallelLinear`` / ``RowParallelLinear`` / ``ReplicatedLinear``).
+Weights are NOT copied here — the parallel params carry vLLM's
+``weight_loader`` sharding metadata, so the ordinary loader path
+(``AutoWeightsLoader`` over the lazily-iterated safetensors) narrows each
+checkpoint tensor to the local rank while streaming it, and no full-size
+host copy of the encoder ever exists.
 
-Unlike the layer-slice variant this is standard megatron sharding, but it can
-only shard over the DiT TP group: ``text_encoder_tp_size`` must equal the DiT
-tensor-parallel size (validated by the pipeline).
+The collectives ride the vLLM TP group (which vllm-omni binds to the DiT TP
+group), so the encoder shards over exactly the DiT TP ranks.  Full-attention
+blocks split heads per rank; the linear-attention (GDN) projections use the
+plan's ``colwise_gather_output`` style so the recurrence still sees the full
+hidden state.
 """
 
 from __future__ import annotations
 
-import gc
 import re
 
 import torch
@@ -42,37 +43,13 @@ _STYLES = {
 _SKIPPED_STYLES = {"replicated_with_grad_allreduce", "local", "gather", "local_packed_rowwise"}
 
 
-def _shard_weight(new_linear: nn.Module, old_linear: nn.Linear, style: str, rank: int, tp_size: int) -> None:
-    """Copy the rank-local shard of ``old_linear``'s weights into ``new_linear``."""
-    weight = old_linear.weight.data
-    if style == "colwise":
-        if weight.shape[0] % tp_size:
-            raise ValueError(f"colwise weight rows {weight.shape[0]} not divisible by tp_size {tp_size}")
-        shard = weight.narrow(0, rank * (weight.shape[0] // tp_size), weight.shape[0] // tp_size)
-    elif style == "rowwise":
-        if weight.shape[1] % tp_size:
-            raise ValueError(f"rowwise weight cols {weight.shape[1]} not divisible by tp_size {tp_size}")
-        shard = weight.narrow(1, rank * (weight.shape[1] // tp_size), weight.shape[1] // tp_size)
-    else:  # replicate
-        shard = weight
-    new_linear.weight.data.copy_(shard)
-
-    if old_linear.bias is not None:
-        if style == "colwise":
-            per = old_linear.bias.shape[0] // tp_size
-            new_linear.bias.data.copy_(old_linear.bias.data.narrow(0, rank * per, per))
-        else:
-            # RowParallel adds the full bias after the all-reduce; replicate keeps it whole.
-            new_linear.bias.data.copy_(old_linear.bias.data)
-
-
-def shard_text_encoder_megatron_tp(text_encoder: nn.Module, rank: int, tp_size: int) -> None:
-    """Shard ``text_encoder`` in place per its HF ``tp_plan``.
+def apply_text_encoder_tp_plan(text_encoder: nn.Module) -> None:
+    """Swap tp_plan-covered linears of ``text_encoder`` for vLLM parallel classes.
 
     The checkpoint's ``visual`` tower (unused by this text-only pipeline) is
-    dropped.  Any ``nn.Linear`` under ``language_model`` not covered by the
-    plan raises instead of silently staying replicated — silently keeping a
-    large projection full-size would defeat the point.
+    dropped.  Any ``nn.Linear`` under the language model that the plan does
+    not cover raises instead of silently staying replicated — keeping a large
+    projection full-size would defeat the point.
     """
     tp_plan = getattr(text_encoder, "tp_plan", None) or {}
     if not tp_plan:
@@ -81,7 +58,6 @@ def shard_text_encoder_megatron_tp(text_encoder: nn.Module, rank: int, tp_size: 
     if getattr(text_encoder, "visual", None) is not None:
         del text_encoder.visual
 
-    language_model = getattr(text_encoder, "language_model", None) or text_encoder
     patterns = list(tp_plan.items())
     unmatched: list[str] = []
 
@@ -95,10 +71,11 @@ def shard_text_encoder_megatron_tp(text_encoder: nn.Module, rank: int, tp_size: 
                     continue
                 if style in _SKIPPED_STYLES:
                     continue
-                new_linear = replace_linear_class(child, _STYLES[style], prefix=qual_name)
-                shard_style = "colwise" if style.startswith("colwise") else "rowwise" if style.startswith("rowwise") else "replicate"
-                _shard_weight(new_linear, child, shard_style, rank, tp_size)
-                setattr(module, child_name, new_linear)
+                setattr(
+                    module,
+                    child_name,
+                    replace_linear_class(child, _STYLES[style], prefix=qual_name),
+                )
             else:
                 _recursive_replace(child, qual_name)
 
@@ -107,4 +84,3 @@ def shard_text_encoder_megatron_tp(text_encoder: nn.Module, rank: int, tp_size: 
     leaked = [name for name in unmatched if name.split(".")[0] in ("language_model", "layers")]
     if leaked:
         raise ValueError(f"tp_plan did not cover these text-encoder linears: {leaked}")
-    gc.collect()
