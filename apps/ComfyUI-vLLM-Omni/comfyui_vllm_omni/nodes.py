@@ -33,6 +33,49 @@ from .utils.validators import (
 
 logger = get_logger(__name__)
 
+
+def _make_progress_callback():
+    """Update ComfyUI's progress bar from streamed denoise progress events."""
+    from comfy.utils import ProgressBar
+
+    bar = None
+
+    def on_progress(step: int, total: int) -> None:
+        nonlocal bar
+        try:
+            if bar is None:
+                bar = ProgressBar(total)
+            bar.update_absolute(step, total)
+        except Exception:  # progress display must never break generation
+            logger.debug("Progress bar update failed", exc_info=True)
+
+    return on_progress
+
+
+def _make_preview_callback():
+    """Push streamed latent previews (JPEG b64) to the ComfyUI frontend."""
+    try:
+        from server import BinaryEventTypes, PromptServer
+    except Exception:  # pragma: no cover - headless/test environments
+        BinaryEventTypes = None
+        PromptServer = None
+
+    def on_preview(b64_jpeg: str) -> None:
+        if PromptServer is None or BinaryEventTypes is None:
+            return
+        try:
+            import base64
+
+            PromptServer.instance.send_sync(
+                BinaryEventTypes.UNENCODED_PREVIEW_IMAGE,
+                base64.b64decode(b64_jpeg),
+                None,
+            )
+        except Exception:  # previews are strictly best-effort
+            logger.debug("Preview push failed", exc_info=True)
+
+    return on_preview
+
 FASTH3_INFERENCE_STEPS = 4
 FASTH3_FPS = 24
 # A FastH3 deployment may expose H3 under any --served-model-name, so the payload
@@ -97,6 +140,19 @@ class VLLMOmniGenerateImage(_VLLMOmniGenerateBase):
                 "sampling_params": ("SAMPLING_PARAMS",),
                 "lora": ("REMOTE_LORA",),
                 "controlnet": ("REMOTE_CONTROLNET",),
+                # Append new ports last so links in saved workflows keep their slots.
+                "stream": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": (
+                            "Stream denoise progress + latent previews from the server (SSE). "
+                            "Only applies to text-to-image via /v1/images/generations; the edit/"
+                            "ControlNet path has no streaming and ignores this. Servers without "
+                            "streaming support answer plain JSON and are handled transparently."
+                        ),
+                    },
+                ),
             },
         }
 
@@ -121,6 +177,7 @@ class VLLMOmniGenerateImage(_VLLMOmniGenerateBase):
         sampling_params: dict | list[dict] | None = None,
         lora: dict | list[dict] | None = None,
         controlnet: dict | None = None,
+        stream: bool = True,
         **kwargs,
     ):
         if kwargs:
@@ -150,17 +207,32 @@ class VLLMOmniGenerateImage(_VLLMOmniGenerateBase):
             if audio is None and image is None and video is None and controlnet is None:
                 # No multimodal input --- use DALL-E image generation
                 logger.info("Using DALL-E image generation endpoint")
-                output = await client.generate_image(
-                    model=model,
-                    prompt=prompt,
-                    width=width,
-                    height=height,
-                    negative_prompt=negative_prompt,
-                    sampling_params=sampling_params,
-                    lora=lora,
-                    output_format=output_format,
-                    output_compression=output_compression,
-                )
+                if stream:
+                    output = await client.generate_image_stream(
+                        model=model,
+                        prompt=prompt,
+                        width=width,
+                        height=height,
+                        negative_prompt=negative_prompt,
+                        sampling_params=sampling_params,
+                        lora=lora,
+                        output_format=output_format,
+                        output_compression=output_compression,
+                        on_progress=_make_progress_callback(),
+                        on_preview=_make_preview_callback(),
+                    )
+                else:
+                    output = await client.generate_image(
+                        model=model,
+                        prompt=prompt,
+                        width=width,
+                        height=height,
+                        negative_prompt=negative_prompt,
+                        sampling_params=sampling_params,
+                        lora=lora,
+                        output_format=output_format,
+                        output_compression=output_compression,
+                    )
                 return (output,)
             elif (image is not None or controlnet is not None) and audio is None and video is None:
                 # Image and text input --- use DALL-E image edit.

@@ -33,6 +33,17 @@ from .format import (
 from .latent_mask import scalar_mask_to_json, video_mask_to_json
 from .logger import get_logger, pretty_printer
 from .models import lookup_model_spec
+from .sse import (
+    EVENT_DONE,
+    EVENT_ERROR,
+    EVENT_IMAGE,
+    EVENT_PREVIEW,
+    EVENT_PROGRESS,
+    extract_images_b64,
+    extract_preview_b64,
+    extract_progress,
+    parse_sse_line,
+)
 from .types import (
     MAX_REFERENCE_AUDIOS,
     MAX_REFERENCE_IMAGES,
@@ -71,6 +82,27 @@ async def url_bytes(session: aiohttp.ClientSession, url: str, verb: str = "get",
             return await response.read()
     except aiohttp.ClientError as e:
         raise RuntimeError(f"Network error connecting to vLLM-Omni at {url}: {e}")
+
+
+def _images_json_to_tensor(data: dict) -> torch.Tensor:
+    """Decode an OpenAI DALL-E JSON image response into a batch tensor."""
+    if "data" not in data:
+        raise RuntimeError("API response missing 'data' field - expected OpenAI DALL-E format")
+    if not data["data"]:
+        raise RuntimeError("API returned empty data array")
+
+    image_tensors = []
+    for idx, img in enumerate(data["data"]):
+        if "b64_json" not in img:
+            raise RuntimeError(f"API returned image #{idx} without 'b64_json' field")
+        base64_str = img["b64_json"]
+        tensor = base64_to_image_tensor(base64_str)
+        image_tensors.append(tensor)
+        logger.debug("Image #%d has shape %s", idx, tensor.shape)
+
+    batch_tensor = torch.stack(image_tensors, dim=0)
+    logger.debug("batch_tensor output has shape: %s", batch_tensor.shape)
+    return batch_tensor
 
 
 class VLLMOmniClient:
@@ -137,20 +169,115 @@ class VLLMOmniClient:
                         data = await response.json()
                     except aiohttp.ContentTypeError as e:
                         raise RuntimeError(f"Invalid JSON response from vLLM-Omni: {e}")
-                    if "data" not in data:
-                        raise RuntimeError("API response missing 'data' field - expected OpenAI DALL-E format")
-                    if not data["data"]:
-                        raise RuntimeError("API returned empty data array")
+                    return _images_json_to_tensor(data)
+
+            except aiohttp.ClientError as e:
+                raise RuntimeError(f"Network error connecting to vLLM-Omni at {url}: {e}")
+
+    async def generate_image_stream(
+        self,
+        *,
+        model: str,
+        prompt: str,
+        width: int,
+        height: int,
+        negative_prompt: str | None = None,
+        sampling_params: dict | None = None,
+        lora: dict | list[dict] | None = None,
+        output_format: str = "webp",
+        output_compression: int = 90,
+        preview_interval: int | None = None,
+        preview_max_side: int | None = None,
+        on_progress: Any = None,
+        on_preview: Any = None,
+    ) -> torch.Tensor:
+        """Text-to-image via the SSE streaming endpoint (stream=true).
+
+        Servers with streaming support answer ``text/event-stream`` and emit
+        image.generation.chunk progress/preview events before the final image.
+        Servers without it ignore the unknown ``stream`` field and answer
+        plain JSON, which is detected via Content-Type and decoded exactly
+        like :meth:`generate_image` — so this is safe against old servers.
+
+        ``on_progress(step, total)`` and ``on_preview(b64_jpeg)`` are invoked
+        synchronously from the read loop; keep them cheap.
+        """
+        await self._check_model_exist(model)
+
+        size = f"{width}x{height}"
+        payload: dict[str, Any] = {
+            "model": model,
+            "prompt": prompt,
+            "size": size,
+            "response_format": "b64_json",
+            "output_format": output_format,
+            "output_compression": output_compression,
+            "stream": True,
+        }
+        if negative_prompt:
+            payload["negative_prompt"] = negative_prompt
+        if preview_interval is not None:
+            payload["preview_interval"] = preview_interval
+        if preview_max_side is not None:
+            payload["preview_max_side"] = preview_max_side
+        if sampling_params is not None:
+            payload.update(sampling_params)
+        if lora is not None:
+            payload["lora"] = lora
+        logger.debug("img gen (streaming) payload: %s", payload)
+
+        url = self.base_url + "/images/generations"
+        async with aiohttp.ClientSession(timeout=self.timeout) as session:
+            try:
+                async with session.post(
+                    url,
+                    json=payload,
+                    headers={"Content-Type": "application/json"},
+                ) as response:
+                    if not response.ok:
+                        error_text = await response.text()
+                        raise (ValueError if response.status < 500 else RuntimeError)(
+                            f"vLLM-Omni API returned status {response.status}: {error_text}"
+                        )
+
+                    if "text/event-stream" not in (response.headers.get("Content-Type") or ""):
+                        # Old server without streaming support: plain JSON.
+                        return _images_json_to_tensor(await response.json())
+
+                    image_b64_list: list[str] = []
+                    done = False
+                    while not done:
+                        line = await response.content.readline()
+                        if not line:  # connection closed mid-stream
+                            break
+                        parsed = parse_sse_line(line.decode("utf-8", errors="replace"))
+                        if parsed is None:
+                            continue
+                        kind, event = parsed
+                        if kind == EVENT_DONE:
+                            done = True
+                        elif kind == EVENT_PROGRESS:
+                            if on_progress is not None:
+                                on_progress(*extract_progress(event))
+                        elif kind == EVENT_PREVIEW:
+                            if on_preview is not None:
+                                b64 = extract_preview_b64(event)
+                                if b64:
+                                    on_preview(b64)
+                        elif kind == EVENT_IMAGE:
+                            image_b64_list.extend(extract_images_b64(event))
+                        elif kind == EVENT_ERROR:
+                            message = (event.get("error") or {}).get("message", "unknown streaming error")
+                            raise RuntimeError(f"vLLM-Omni streaming generation failed: {message}")
+
+                    if not image_b64_list:
+                        raise RuntimeError("Streaming image generation ended without a final image")
 
                     image_tensors = []
-                    for idx, img in enumerate(data["data"]):
-                        if "b64_json" not in img:
-                            raise RuntimeError(f"API returned image #{idx} without 'b64_json' field")
-                        base64_str = img["b64_json"]
+                    for idx, base64_str in enumerate(image_b64_list):
                         tensor = base64_to_image_tensor(base64_str)
                         image_tensors.append(tensor)
                         logger.debug("Image #%d has shape %s", idx, tensor.shape)
-
                     batch_tensor = torch.stack(image_tensors, dim=0)
                     logger.debug("batch_tensor output has shape: %s", batch_tensor.shape)
                     return batch_tensor
