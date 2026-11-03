@@ -119,7 +119,8 @@ def test_text_encoder_is_a_cpu_skeleton_and_vae_stays_on_pretrained(monkeypatch:
     param = next(pipeline.text_encoder.parameters())
     assert param.device.type == "cpu" and param.dtype == torch.float16
     assert pipeline.text_encoder_tp_size == 1
-    te_source = pipeline.weights_sources[1]
+    # TE streams first (moved off host before the DiT stream starts), DiT second.
+    te_source = pipeline.weights_sources[0]
     assert te_source.subfolder == "text_encoder" and te_source.prefix == "text_encoder."
     # Both big components must stream one tensor at a time: the multi-thread
     # loader reads whole shard files (num_weight_load_threads at a time) into
@@ -128,6 +129,44 @@ def test_text_encoder_is_a_cpu_skeleton_and_vae_stays_on_pretrained(monkeypatch:
 
     # With no offload selected the VAE moved to the pipeline device (CPU here).
     assert next(pipeline.vae.parameters()).device.type == "cpu"
+
+
+def test_text_encoder_leaves_host_before_dit_streams() -> None:
+    """load_weights must move the TE to its runtime device at the TE/DiT stream boundary.
+
+    The TE (~15 GiB fp16) and the DiT (~9.5 GiB) must never sit in host RAM at
+    the same time on a rank; streaming the DiT into CPU params while the TE is
+    still staged there doubles the per-rank startup peak.
+    """
+    pipeline = MOSSImagePipeline.__new__(MOSSImagePipeline)
+    nn.Module.__init__(pipeline)
+    pipeline.text_encoder = nn.Linear(2, 2)
+    pipeline.transformer = nn.Linear(2, 2)
+    pipeline._text_encoder_device = torch.device("meta")  # marker for "moved off host"
+
+    events: list[str] = []
+    module_to = nn.Module.to
+
+    def recording_to(self, *args, **kwargs):
+        # At move time the DiT must not have received any streamed weights yet.
+        dit_loaded = bool((pipeline.transformer.weight == 1).all())
+        events.append(f"MOVE(dit_loaded={dit_loaded})")
+        return module_to(self, *args, **kwargs)
+
+    import types
+
+    pipeline.text_encoder.to = types.MethodType(recording_to, pipeline.text_encoder)  # type: ignore[method-assign]
+
+    def weights():
+        for name in ("text_encoder.weight", "text_encoder.bias", "transformer.weight", "transformer.bias"):
+            yield name, torch.ones(2, 2) if name.endswith("weight") else torch.ones(2)
+
+    loaded = pipeline.load_weights(weights())
+
+    assert loaded == {"text_encoder.weight", "text_encoder.bias", "transformer.weight", "transformer.bias"}
+    assert events == ["MOVE(dit_loaded=False)"]  # exactly one move, before the DiT stream
+    assert pipeline.text_encoder.weight.is_meta  # moved to the marker device
+    assert bool((pipeline.transformer.weight == 1).all())  # DiT weights still landed
 
 
 def test_text_encoder_dtype_defaults_to_bf16(monkeypatch: pytest.MonkeyPatch) -> None:

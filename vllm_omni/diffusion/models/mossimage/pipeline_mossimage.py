@@ -232,16 +232,12 @@ class MOSSImagePipeline(nn.Module, SkipLayerGuidanceMixin, DiffusionPipelineProf
         # read whole ~4-5 GiB shard files into host RAM, up to
         # num_weight_load_threads at once, on every rank — several times the
         # size of the component itself, which OOMs small-RAM multi-GPU nodes.
+        #
+        # The text encoder streams FIRST: load_weights moves it to its runtime
+        # device the moment its stream finishes, so the ~15 GiB fp16 encoder
+        # never overlaps the DiT stream in host RAM on the same rank.
         self.weights_sources = [
-            DiffusersPipelineLoader.ComponentSource(
-                model_or_path=od_config.model,
-                subfolder="transformer",
-                revision=od_config.revision,
-                prefix="transformer.",
-                fall_back_to_pt=True,
-                streaming_load=True,
-            ),
-            # The text encoder streams its weights through the loader too:
+            # The text encoder streams its weights through the loader:
             # safetensors tensors are read one at a time and narrowed into
             # the (possibly TP-sharded) params on arrival, so no full-size
             # host copy of the encoder ever exists.
@@ -250,6 +246,14 @@ class MOSSImagePipeline(nn.Module, SkipLayerGuidanceMixin, DiffusionPipelineProf
                 subfolder="text_encoder",
                 revision=od_config.revision,
                 prefix="text_encoder.",
+                fall_back_to_pt=True,
+                streaming_load=True,
+            ),
+            DiffusersPipelineLoader.ComponentSource(
+                model_or_path=od_config.model,
+                subfolder="transformer",
+                revision=od_config.revision,
+                prefix="transformer.",
                 fall_back_to_pt=True,
                 streaming_load=True,
             ),
@@ -359,7 +363,8 @@ class MOSSImagePipeline(nn.Module, SkipLayerGuidanceMixin, DiffusionPipelineProf
 
         The loader feeds weights from ``weights_sources`` straight into the —
         possibly TP-sharded — params (``load_weights`` moves the module to its
-        runtime device afterwards). A from_pretrained load would materialize
+        runtime device as soon as the encoder's stream finishes, before the
+        DiT streams in). A from_pretrained load would materialize
         the full ~15.6 GiB bf16 encoder in host RAM on every rank (twice over
         with the fp16 cast in flight) before any sharding could drop half of
         it, which OOMs the host on small-RAM multi-GPU nodes.
@@ -780,8 +785,19 @@ class MOSSImagePipeline(nn.Module, SkipLayerGuidanceMixin, DiffusionPipelineProf
         # The vision tower is deleted at construction; its checkpoint keys are
         # expected-but-unused, not an error.
         loader = AutoWeightsLoader(self, ignore_unexpected_prefixes=["text_encoder.visual."])
-        loaded = loader.load_weights(weights)
-        # The text encoder skeleton was built on CPU and its weights streamed
-        # into place above; only now does it move to its runtime device.
-        self.text_encoder = self.text_encoder.to(self._text_encoder_device)
-        return loaded
+
+        # weights_sources streams the text encoder before the DiT. Move the TE
+        # to its runtime device the moment its stream finishes: its ~15 GiB
+        # fp16 host copy must not overlap the DiT stream on small-RAM hosts
+        # (a no-op when the TE is offloaded and its runtime device is the CPU).
+        def move_te_as_soon_as_streamed():
+            moved = False
+            for name, tensor in weights:
+                if not moved and not name.startswith("text_encoder."):
+                    self.text_encoder = self.text_encoder.to(self._text_encoder_device)
+                    moved = True
+                yield name, tensor
+            if not moved:
+                self.text_encoder = self.text_encoder.to(self._text_encoder_device)
+
+        return loader.load_weights(move_te_as_soon_as_streamed())
