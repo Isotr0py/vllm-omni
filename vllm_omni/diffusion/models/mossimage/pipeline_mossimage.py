@@ -35,10 +35,13 @@ sliced/tiled fp32 decode, and ``--vae-patch-parallel-size`` > 1 wraps
 (vae_patch_parallel.py).
 
 Text-encoder quantization: route ``{"text_encoder": {"method":
-"bitsandbytes", "quant_type": "nf4"}}`` through ``--diffusion-quantization-config``
-for bnb nf4/fp4 weight-only quantization (sm75+; vLLM ``int8`` is accepted
-too but needs sm80+). Shards quantize in place as their weights stream in;
-the text encoder cannot be CPU-offloaded (DLO) while quantized.
+"convrot_int8"}}`` through ``--diffusion-quantization-config`` for rotated
+W8A8 weight quantization (vLLM INT8 kernels; the sm75 int8 cutlass dispatch
+makes it T4-compatible — the config's declared min capability 80 is
+unenforced on the diffusion path). bnb nf4/fp4 also works but cannot combine
+with TE offload (its quant_state is module side state, not a parameter).
+Shards quantize in place as their weights stream in; the DiT is untouched
+(its quant_config stays stored-but-unused).
 """
 
 from __future__ import annotations
@@ -398,27 +401,31 @@ class MOSSImagePipeline(nn.Module, SkipLayerGuidanceMixin, DiffusionPipelineProf
         """Resolve and validate a quantization config routed at ``text_encoder``.
 
         Only online weight-only methods work with the CPU-staged streaming
-        load: bnb nf4/fp4 (sm75+) and vLLM int8 (sm80+). Quantized weights are
-        only well-formed after their on-device quantization step, so TE CPU
-        offload (DLO/layerwise storage relocation) is rejected outright.
+        load: convrot_int8 / int8 (vLLM INT8 kernels; sm75+, the T4 default is
+        convrot_int8) and bnb nf4/fp4 (sm75+). The int8 family keeps its state
+        in real Parameters/buffers, so it survives DLO/layerwise storage
+        relocation; bnb keeps ``quant_state`` as a module attribute that those
+        backends would lose, so bnb x TE offload is rejected outright.
         """
         from vllm_omni.quantization.component_config import resolve_component_quant_config
 
         quant_config = resolve_component_quant_config(self.od_config.quantization_config, "text_encoder")
         if quant_config is None:
             return None
-        if quant_config.get_name() not in ("bitsandbytes", "int8"):
+        if quant_config.get_name() not in ("convrot_int8", "int8", "bitsandbytes"):
             raise ValueError(
                 "MOSS-Image text encoder supports only online weight-only quantization "
-                "('bitsandbytes' nf4/fp4, or 'int8' on sm80+); "
+                "('convrot_int8', or 'int8' / 'bitsandbytes' nf4/fp4); "
                 f"got {quant_config.get_name()!r}."
             )
-        if resolve_offload(self.od_config).offloads(TEXT_ENCODER_COMPONENT):
+        if quant_config.get_name() == "bitsandbytes" and resolve_offload(self.od_config).offloads(
+            TEXT_ENCODER_COMPONENT
+        ):
             raise ValueError(
-                "text_encoder quantization is incompatible with text_encoder offload: "
-                "DLO/layerwise backends relocate raw storages and would lose the quantized "
-                "side state (e.g. bnb quant_state). Keep components=['dit'] "
-                "(TE stays resident) or drop the text_encoder quantization config."
+                "bnb text_encoder quantization is incompatible with text_encoder offload: "
+                "DLO/layerwise backends relocate raw storages and would lose bnb's quant_state "
+                "side channel. Use 'convrot_int8'/'int8' (their state lives in plain parameters), "
+                "keep components=['dit'], or drop the text_encoder quantization config."
             )
         return quant_config
 
