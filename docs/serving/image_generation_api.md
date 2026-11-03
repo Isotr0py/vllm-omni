@@ -149,6 +149,63 @@ Content-Type: application/json
 | `guidance_scale` | float | model defaults | Classifier-free guidance scale (typically 0.0-20.0) |
 | `true_cfg_scale` | float | model defaults | True CFG scale (model-specific parameter, may be ignored if not supported) |
 | `seed` | integer | null | Random seed for reproducibility |
+| `stream` | boolean | false | Stream denoise progress/preview chunks as SSE (single-stage pipelines; see below) |
+| `preview_interval` | integer | 5 | With `stream=true`, decode a low-resolution JPEG preview every N denoise steps (pipeline support required) |
+| `preview_max_side` | integer | 256 | Long-edge pixel size of streamed preview images |
+
+### Streaming Response Format
+
+Set `stream=true` to receive denoise progress (and optional low-resolution
+latent previews) while the image is being generated — useful for long
+generations and for keeping proxied connections alive. Streaming is currently
+wired for single-stage diffusion pipelines; multi-stage pipelines ignore
+`stream` and answer with the ordinary JSON response.
+
+The response uses Server-Sent Events with `Content-Type: text/event-stream`.
+Each event is one `data:` line. The stream order is:
+
+1. One progress chunk per denoise step (requires the diffusion stage to run
+   with step execution enabled, e.g. `--step-execution`; without it no
+   intermediate chunks exist).
+2. A preview chunk at every `preview_interval` steps when the pipeline
+   implements preview decoding (currently MOSS-Image; previews decode the
+   average-pooled in-flight latents through the real VAE at reduced
+   resolution, so they are cheap and strictly best-effort).
+3. One final image chunk (identical payload to the non-streaming `data` array).
+4. `data: [DONE]`.
+
+Example progress event:
+
+```text
+data: {"object":"image.generation.chunk","type":"progress","step":10,"total":50,"created":1701234567,"model":"moss-image"}
+```
+
+Example preview event (`b64_json` is a small JPEG):
+
+```text
+data: {"object":"image.generation.chunk","type":"preview","step":10,"total":50,"data":[{"b64_json":"<base64-encoded JPEG>","url":null,"revised_prompt":null}],"created":1701234567,"model":"moss-image"}
+```
+
+Example final image event:
+
+```text
+data: {"object":"image.generation.chunk","type":"image","data":[{"b64_json":"<base64-encoded PNG>","url":null,"revised_prompt":null}],"output_format":"png","size":"1024x1024","created":1701234567,"model":"moss-image"}
+```
+
+Terminal event:
+
+```text
+data: [DONE]
+```
+
+If the engine fails after the SSE response has started, the stream emits an
+error chunk followed by `[DONE]`:
+
+```text
+data: {"object":"error","created":1701234567,"model":"moss-image","error":{"message":"<error message>","type":"server_error","code":500}}
+
+data: [DONE]
+```
 
 ### Response Format
 

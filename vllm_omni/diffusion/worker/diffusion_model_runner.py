@@ -63,6 +63,7 @@ from vllm_omni.diffusion.offloader.config import (
     resolve_offload_strategy,
 )
 from vllm_omni.diffusion.postprocess.device_reduction import prepare_diffusion_media_for_transport
+from vllm_omni.diffusion.progress import build_progress_output
 from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import (
@@ -752,6 +753,20 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 sampling_params=sampling_params,
             )
         return output
+
+    def _maybe_build_progress_output(self, req: Any, is_primary: bool) -> DiffusionOutput | None:
+        """Non-terminal progress/preview chunk for SSE image streaming."""
+        extra_args = getattr(req.sampling, "extra_args", None) or {}
+        timesteps = getattr(req, "timesteps", None)
+        return build_progress_output(
+            self.pipeline,
+            extra_args=extra_args,
+            step_index=req.step_index,
+            total=len(timesteps) if timesteps is not None else 0,
+            latents=getattr(req, "latents", None),
+            request_id=getattr(req, "request_id", ""),
+            is_primary=is_primary,
+        )
 
     def _runner_output_from_outputs(
         self,
@@ -1525,7 +1540,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                                             pipe.apply_interaction_at_chunk_boundary(req)
                                             pipe.prepare_next_chunk(req)
                             else:
-                                result = None
+                                result = self._maybe_build_progress_output(req, is_primary)
                             # finished should be computed after post_decode() advanced chunk_index
                             finished = (
                                 req.request_denoise_completed

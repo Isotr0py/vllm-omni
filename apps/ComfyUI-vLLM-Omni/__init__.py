@@ -14,80 +14,97 @@ __author__ = """vLLM-Omni Team"""
 __email__ = "vllm-omni@vllm.ai"
 __version__ = "0.0.1"
 
-from .comfyui_vllm_omni.nodes import (
-    VLLMOmniARSampling,
-    VLLMOmniDiffusionSampling,
-    VLLMOmniFastH3Deployment,
-    VLLMOmniGenerateImage,
-    VLLMOmniGenerateMusic,
-    VLLMOmniGenerateVideo,
-    VLLMOmniLatentMaskEditing,
-    VLLMOmniMiniMaxH3Guide,
-    VLLMOmniMiniMaxH3Params,
-    VLLMOmniMiniMaxH3TemporalMask,
-    VLLMOmniQwenTTSParams,
-    VLLMOmniRemoteLoRA,
-    VLLMOmniRestoreVideo,
-    VLLMOmniSamplingParamsList,
-    VLLMOmniTTS,
-    VLLMOmniUnderstanding,
-    VLLMOmniVideoReferences,
-    VLLMOmniVoiceClone,
-    VLLMOmniWanParams,
-    VLLMOmniYuE2Params,
-)
+try:
+    from .comfyui_vllm_omni.nodes import (
+        VLLMOmniARSampling,
+        VLLMOmniDiffusionSampling,
+        VLLMOmniFastH3Deployment,
+        VLLMOmniGenerateImage,
+        VLLMOmniGenerateMusic,
+        VLLMOmniGenerateVideo,
+        VLLMOmniLatentMaskEditing,
+        VLLMOmniMiniMaxH3Guide,
+        VLLMOmniMiniMaxH3Params,
+        VLLMOmniMiniMaxH3TemporalMask,
+        VLLMOmniQwenTTSParams,
+        VLLMOmniRemoteLoRA,
+        VLLMOmniRestoreVideo,
+        VLLMOmniSamplingParamsList,
+        VLLMOmniTTS,
+        VLLMOmniUnderstanding,
+        VLLMOmniVideoReferences,
+        VLLMOmniVoiceClone,
+        VLLMOmniWanParams,
+        VLLMOmniYuE2Params,
+    )
+except ModuleNotFoundError as exc:
+    # Outside a ComfyUI runtime (e.g. pytest unit tests) the comfy/server
+    # modules do not exist; other missing modules are real bugs and re-raise.
+    if (exc.name or "").split(".")[0] not in {"comfy", "comfy_api", "comfy_extras", "server", "folder_paths"}:
+        raise
+    NODE_CLASS_MAPPINGS: dict = {}
+    NODE_DISPLAY_NAME_MAPPINGS: dict = {}
+except ImportError as exc:
+    # pytest's Package collector imports this file as a top-level module
+    # named "__init__", where the relative import above cannot resolve.
+    # ComfyUI itself always loads this file as a package.
+    if "parent package" not in str(exc):
+        raise
+    NODE_CLASS_MAPPINGS: dict = {}
+    NODE_DISPLAY_NAME_MAPPINGS: dict = {}
+else:
 
-# A dictionary that contains all nodes you want to export with their names
-NODE_CLASS_MAPPINGS = {
-    # === Generation ===
-    "VLLMOmniGenerateImage": VLLMOmniGenerateImage,
-    "VLLMOmniGenerateVideo": VLLMOmniGenerateVideo,
-    "VLLMOmniRestoreVideo": VLLMOmniRestoreVideo,
-    "VLLMOmniUnderstanding": VLLMOmniUnderstanding,
-    "VLLMOmniTTS": VLLMOmniTTS,
-    "VLLMOmniGenerateMusic": VLLMOmniGenerateMusic,
-    "VLLMOmniVoiceClone": VLLMOmniVoiceClone,
-    "VLLMOmniVideoReferences": VLLMOmniVideoReferences,
-    "VLLMOmniLatentMaskEditing": VLLMOmniLatentMaskEditing,
-    "VLLMOmniMiniMaxH3TemporalMask": VLLMOmniMiniMaxH3TemporalMask,
-    "VLLMOmniMiniMaxH3Guide": VLLMOmniMiniMaxH3Guide,
-    # === Params ===
-    "VLLMOmniARSampling": VLLMOmniARSampling,
-    "VLLMOmniDiffusionSampling": VLLMOmniDiffusionSampling,
-    "VLLMOmniSamplingParamsList": VLLMOmniSamplingParamsList,
-    "VLLMOmniRemoteLoRA": VLLMOmniRemoteLoRA,
-    "VLLMOmniFastH3Deployment": VLLMOmniFastH3Deployment,
-    "VLLMOmniQwenTTSParams": VLLMOmniQwenTTSParams,
-    "VLLMOmniWanParams": VLLMOmniWanParams,
-    "VLLMOmniYuE2Params": VLLMOmniYuE2Params,
-    "VLLMOmniMiniMaxH3Params": VLLMOmniMiniMaxH3Params,
-}
+    # A dictionary that contains all nodes you want to export with their names
+    NODE_CLASS_MAPPINGS = {
+        # === Generation ===
+        "VLLMOmniGenerateImage": VLLMOmniGenerateImage,
+        "VLLMOmniGenerateVideo": VLLMOmniGenerateVideo,
+        "VLLMOmniRestoreVideo": VLLMOmniRestoreVideo,
+        "VLLMOmniUnderstanding": VLLMOmniUnderstanding,
+        "VLLMOmniTTS": VLLMOmniTTS,
+        "VLLMOmniGenerateMusic": VLLMOmniGenerateMusic,
+        "VLLMOmniVoiceClone": VLLMOmniVoiceClone,
+        "VLLMOmniVideoReferences": VLLMOmniVideoReferences,
+        "VLLMOmniLatentMaskEditing": VLLMOmniLatentMaskEditing,
+        "VLLMOmniMiniMaxH3TemporalMask": VLLMOmniMiniMaxH3TemporalMask,
+        "VLLMOmniMiniMaxH3Guide": VLLMOmniMiniMaxH3Guide,
+        # === Params ===
+        "VLLMOmniARSampling": VLLMOmniARSampling,
+        "VLLMOmniDiffusionSampling": VLLMOmniDiffusionSampling,
+        "VLLMOmniSamplingParamsList": VLLMOmniSamplingParamsList,
+        "VLLMOmniRemoteLoRA": VLLMOmniRemoteLoRA,
+        "VLLMOmniFastH3Deployment": VLLMOmniFastH3Deployment,
+        "VLLMOmniQwenTTSParams": VLLMOmniQwenTTSParams,
+        "VLLMOmniWanParams": VLLMOmniWanParams,
+        "VLLMOmniYuE2Params": VLLMOmniYuE2Params,
+        "VLLMOmniMiniMaxH3Params": VLLMOmniMiniMaxH3Params,
+    }
 
-# A dictionary that contains the friendly/humanly readable titles for the nodes
-NODE_DISPLAY_NAME_MAPPINGS = {
-    # === Generation ===
-    "VLLMOmniGenerateImage": "Generate Image",
-    "VLLMOmniGenerateVideo": "Generate Video",
-    "VLLMOmniRestoreVideo": "Restore Video (SeedVR2)",
-    "VLLMOmniUnderstanding": "Multimodality Understanding",
-    "VLLMOmniTTS": "TTS (Text to Speech)",
-    "VLLMOmniGenerateMusic": "Generate Music",
-    "VLLMOmniVoiceClone": "TTS Voice Cloning",
-    "VLLMOmniVideoReferences": "Video References",
-    "VLLMOmniLatentMaskEditing": "Latent Mask Editing",
-    "VLLMOmniMiniMaxH3TemporalMask": "MiniMax-H3 Temporal Mask",
-    "VLLMOmniMiniMaxH3Guide": "MiniMax H3 Add Guide",
-    # === Params ===
-    "VLLMOmniARSampling": "AR Sampling Params",
-    "VLLMOmniDiffusionSampling": "Diffusion Sampling Params",
-    "VLLMOmniSamplingParamsList": "Multi-Stage Sampling Params List",
-    "VLLMOmniRemoteLoRA": "LoRA",
-    "VLLMOmniFastH3Deployment": "FastH3 Deployment",
-    "VLLMOmniQwenTTSParams": "Qwen TTS Params",
-    "VLLMOmniWanParams": "Wan Video Params",
-    "VLLMOmniYuE2Params": "YuE2 Params",
-    "VLLMOmniMiniMaxH3Params": "MiniMax-H3 Video Params",
-}
+    # A dictionary that contains the friendly/humanly readable titles for the nodes
+    NODE_DISPLAY_NAME_MAPPINGS = {
+        # === Generation ===
+        "VLLMOmniGenerateImage": "Generate Image",
+        "VLLMOmniGenerateVideo": "Generate Video",
+        "VLLMOmniRestoreVideo": "Restore Video (SeedVR2)",
+        "VLLMOmniUnderstanding": "Multimodality Understanding",
+        "VLLMOmniTTS": "TTS (Text to Speech)",
+        "VLLMOmniGenerateMusic": "Generate Music",
+        "VLLMOmniVoiceClone": "TTS Voice Cloning",
+        "VLLMOmniVideoReferences": "Video References",
+        "VLLMOmniLatentMaskEditing": "Latent Mask Editing",
+        "VLLMOmniMiniMaxH3TemporalMask": "MiniMax-H3 Temporal Mask",
+        "VLLMOmniMiniMaxH3Guide": "MiniMax H3 Add Guide",
+        # === Params ===
+        "VLLMOmniARSampling": "AR Sampling Params",
+        "VLLMOmniDiffusionSampling": "Diffusion Sampling Params",
+        "VLLMOmniSamplingParamsList": "Multi-Stage Sampling Params List",
+        "VLLMOmniRemoteLoRA": "LoRA",
+        "VLLMOmniFastH3Deployment": "FastH3 Deployment",
+        "VLLMOmniQwenTTSParams": "Qwen TTS Params",
+        "VLLMOmniWanParams": "Wan Video Params",
+        "VLLMOmniYuE2Params": "YuE2 Params",
+        "VLLMOmniMiniMaxH3Params": "MiniMax-H3 Video Params",
+    }
 
 WEB_DIRECTORY = "./web"
 

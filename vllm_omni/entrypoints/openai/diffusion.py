@@ -27,6 +27,35 @@ async def _generate_with_async_omni(
 ):
     engine_client = cast(AsyncOmni, engine_client)
     result = None
+    async for output in _iter_with_async_omni(
+        engine_client,
+        gen_params,
+        stage_configs,
+        **kwargs,
+    ):
+        result = output
+
+    if result is None:
+        raise HTTPException(
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+            detail="No output generated from multi-stage pipeline.",
+        )
+    return result
+
+
+async def _iter_with_async_omni(
+    engine_client: AsyncOmni | Any,
+    gen_params: Any,
+    stage_configs: list[Any],
+    **kwargs,
+):
+    """Streaming variant of ``_generate_with_async_omni``: yield every output.
+
+    The final-stage diffusion engine may emit non-terminal progress/preview
+    chunks (SSE image streaming); callers that only need the result should
+    keep the last output like ``_generate_with_async_omni`` does.
+    """
+    engine_client = cast(AsyncOmni, engine_client)
     normalized_stage_configs = list(stage_configs)
     if not normalized_stage_configs:
         raise HTTPException(
@@ -44,14 +73,7 @@ async def _generate_with_async_omni(
         sampling_params_list=sampling_params_list,
         **kwargs,
     ):
-        result = output
-
-    if result is None:
-        raise HTTPException(
-            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
-            detail="No output generated from multi-stage pipeline.",
-        )
-    return result
+        yield output
 
 
 def apply_stage_default_sampling_params(

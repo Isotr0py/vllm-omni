@@ -461,6 +461,15 @@ class MOSSImagePipeline(nn.Module, SkipLayerGuidanceMixin, DiffusionPipelineProf
         scheduler = per_request_scheduler if per_request_scheduler is not None else self.scheduler
         return scheduler.step(noise_pred, timestep, latents, return_dict=False)[0]
 
+    def _prepare_vae_latents(self, latents: torch.Tensor) -> torch.Tensor:
+        """BN-statistics denormalization and 2x2 unpacking before VAE decode."""
+        z = latents.to(dtype=self.vae.dtype)
+        bn = self.vae.bn
+        eps = self.vae.config.batch_norm_eps
+        z = z * (bn.running_var + eps).sqrt().to(z).view(1, -1, 1, 1) + bn.running_mean.to(z).view(1, -1, 1, 1)
+        b, c, h, w = z.shape
+        return z.reshape(b, c // 4, 2, 2, h, w).permute(0, 1, 4, 2, 5, 3).reshape(b, c // 4, 2 * h, 2 * w)
+
     def _vae_decode(self, latents: torch.Tensor) -> torch.Tensor:
         """fp32 VAE decode with BN-statistics denormalization and 2x2 unpacking."""
         # Denoise activations are garbage at this point but still sit in the
@@ -470,13 +479,38 @@ class MOSSImagePipeline(nn.Module, SkipLayerGuidanceMixin, DiffusionPipelineProf
         gc.collect()
         if self.device.type != "cpu":
             torch.accelerator.empty_cache()
-        z = latents.to(dtype=self.vae.dtype)
-        bn = self.vae.bn
-        eps = self.vae.config.batch_norm_eps
-        z = z * (bn.running_var + eps).sqrt().to(z).view(1, -1, 1, 1) + bn.running_mean.to(z).view(1, -1, 1, 1)
-        b, c, h, w = z.shape
-        z = z.reshape(b, c // 4, 2, 2, h, w).permute(0, 1, 4, 2, 5, 3).reshape(b, c // 4, 2 * h, 2 * w)
-        return self.vae.decode(z, return_dict=False)[0].clamp(-1, 1)
+        return self.vae.decode(self._prepare_vae_latents(latents), return_dict=False)[0].clamp(-1, 1)
+
+    @torch.no_grad()
+    def decode_preview(self, latents: torch.Tensor, max_side: int = 256) -> str | None:
+        """Cheap downscaled JPEG preview (b64) of in-flight latents.
+
+        The FLUX.2-klein VAE has no published latent->RGB projection, so the
+        preview runs the real decoder on an average-pooled latent grid sized
+        for ``max_side`` pixels (e.g. a 1024px request decodes a 16x16 packed
+        latent -> 256px image, ~1/16 of the full decode's cost). Only the
+        first image of the batch is previewed. Any failure is swallowed by the
+        caller (previews are strictly best-effort).
+        """
+        import base64
+        import io
+
+        import torch.nn.functional as F
+        from PIL import Image
+
+        z = latents[0:1].float()
+        h, w = z.shape[-2], z.shape[-1]
+        # Packed latents unpack 2x before the 8x VAE upsampling (16x total).
+        target = max(1, max_side // 16)
+        if h > target or w > target:
+            z = F.adaptive_avg_pool2d(z, (min(h, target), min(w, target)))
+        # No gc/empty_cache here (unlike _vae_decode): the small decode must
+        # not stall the TP-collective lockstep with a device sync.
+        image = self.vae.decode(self._prepare_vae_latents(z), return_dict=False)[0][0].clamp(-1, 1)
+        rgb = ((image + 1) * 127.5).round().to(torch.uint8).permute(1, 2, 0).cpu().numpy()
+        buffer = io.BytesIO()
+        Image.fromarray(rgb).save(buffer, format="JPEG", quality=70)
+        return base64.b64encode(buffer.getvalue()).decode("ascii")
 
     # ------------------------------------------------------------------
     # Step-wise execution (continuous batching)

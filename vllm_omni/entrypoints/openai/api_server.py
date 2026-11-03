@@ -136,6 +136,7 @@ from vllm_omni.entrypoints.openai.image_api_utils import (
     parse_size,
     validate_layered_layers,
 )
+from vllm_omni.entrypoints.openai.image_stream import stream_image_generation_sse
 from vllm_omni.entrypoints.openai.images.helpers import (
     _build_hunyuan_edit_extra_args,
     _check_max_generated_image_size,
@@ -2382,6 +2383,32 @@ async def generate_images(
         raw_request.state.request_metadata = RequestResponseMetadata(request_id=request_id)
 
         logger.debug(f"Generating {request.n} image(s) {size_str}")
+
+        if request.stream:
+            # SSE: per-step progress + optional latent previews. Extra args are
+            # consumed by the diffusion runner (progress) and the pipeline's
+            # decode_preview hook (preview); unknown keys are ignored by
+            # pipelines without support, which simply yields no chunks.
+            extra_args["stream_progress"] = True
+            extra_args["preview_interval"] = request.preview_interval or 5
+            extra_args["preview_max_side"] = request.preview_max_side or 256
+            gen_params.extra_args = extra_args
+            return StreamingResponse(
+                stream_image_generation_sse(
+                    engine_client=engine_client,
+                    gen_params=gen_params,
+                    stage_configs=stage_configs,
+                    model_name=model_name,
+                    request=request,
+                    generate_kwargs={
+                        "prompt": prompt,
+                        "request_id": request_id,
+                        "arrival_time": request_timestamp,
+                    },
+                ),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
 
         # Generate images using AsyncOmni.
         result = await _generate_with_async_omni(

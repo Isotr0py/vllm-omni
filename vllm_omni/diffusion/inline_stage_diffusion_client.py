@@ -22,6 +22,7 @@ from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.diffusion.data import (
     DiffusionRequestAbortedError,
+    is_diffusion_progress_output,
     is_diffusion_request_started_output,
 )
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
@@ -163,11 +164,12 @@ class InlineStageDiffusionClient(StageClientBase):
                     self._output_queue.put_nowait(result)
             else:
                 # Non-streaming callers share the streaming engine path but
-                # only publish the final output.
+                # only publish the final output. Opt-in progress/preview
+                # chunks (SSE image streaming) are forwarded as they arrive.
                 result = None
                 async for results in self._engine.step_streaming(request):
                     output = results[0]
-                    if is_diffusion_request_started_output(output):
+                    if is_diffusion_request_started_output(output) or is_diffusion_progress_output(output):
                         if not output.request_id:
                             output.request_id = request_id
                         self._output_queue.put_nowait(output)

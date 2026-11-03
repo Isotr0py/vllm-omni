@@ -81,6 +81,23 @@ class ImageGenerationRequest(BaseModel):
     )
     response_format: ResponseFormat = Field(default=ResponseFormat.B64_JSON, description="Format of the returned image")
     user: str | None = Field(default=None, description="User identifier for tracking")
+    stream: bool | None = Field(
+        default=None,
+        description="Stream denoise progress/preview chunks as SSE instead of a single JSON response. "
+        "Progress chunks require the server to run the diffusion stage with step execution enabled; "
+        "otherwise only the final image chunk is emitted.",
+    )
+    preview_interval: int | None = Field(
+        default=None,
+        ge=1,
+        description="With stream=true, decode a low-resolution JPEG preview every N denoise steps "
+        "(default 5; requires pipeline preview support).",
+    )
+    preview_max_side: int | None = Field(
+        default=None,
+        ge=64,
+        description="Long-edge pixel size of streamed preview images (default 256).",
+    )
     layers: int | None = Field(
         default=None,
         description="Number of output layers for layered image models. Supported range: 2-10.",
@@ -313,6 +330,59 @@ class ImageEditStreamError(BaseModel):
 
 
 ImageEditStreamResponse = ImageEditARDeltaChunk | ImageEditImageChunk | ImageEditStreamError
+
+
+class ImageGenerationProgressChunk(BaseModel):
+    """SSE chunk carrying denoise progress for a streamed image generation."""
+
+    object: Literal["image.generation.chunk"] = "image.generation.chunk"
+    type: Literal["progress"] = "progress"
+    step: int = Field(..., description="Completed denoise steps (1-based)")
+    total: int = Field(..., description="Total denoise steps")
+    created: int = Field(..., description="Unix timestamp of when the stream was created")
+    model: str = Field(..., description="Model used for the image generation request")
+
+
+class ImageGenerationPreviewChunk(BaseModel):
+    """SSE chunk carrying a low-resolution JPEG preview of the in-flight latents."""
+
+    object: Literal["image.generation.chunk"] = "image.generation.chunk"
+    type: Literal["preview"] = "preview"
+    step: int = Field(..., description="Completed denoise steps (1-based)")
+    total: int = Field(..., description="Total denoise steps")
+    data: list[ImageData] = Field(..., description="Single-entry list with a b64 JPEG preview")
+    created: int = Field(..., description="Unix timestamp of when the stream was created")
+    model: str = Field(..., description="Model used for the image generation request")
+
+
+class ImageGenerationImageChunk(BaseModel):
+    """SSE chunk carrying the final image generation result."""
+
+    object: Literal["image.generation.chunk"] = "image.generation.chunk"
+    type: Literal["image"] = "image"
+    data: list[ImageData] = Field(..., description="Array of generated images")
+    output_format: str = Field(..., description="The output format of the image generation")
+    size: str | None = Field(default=None, description="The size of the generated image")
+    created: int = Field(..., description="Unix timestamp of when the stream was created")
+    model: str = Field(..., description="Model used for the image generation request")
+    metrics: dict[str, Any] | None = Field(
+        default=None,
+        description="Per-request generation metrics.",
+    )
+
+
+class ImageGenerationStreamError(BaseModel):
+    """Streaming error chunk emitted before the terminal [DONE] event."""
+
+    object: Literal["error"] = "error"
+    created: int = Field(..., description="Unix timestamp of when the stream was created")
+    model: str = Field(..., description="Model used for the image generation request")
+    error: dict[str, Any] = Field(..., description="OpenAI-compatible streaming error payload")
+
+
+ImageGenerationStreamResponse = (
+    ImageGenerationProgressChunk | ImageGenerationPreviewChunk | ImageGenerationImageChunk | ImageGenerationStreamError
+)
 
 
 class SegmentationMaskFormat(str, Enum):

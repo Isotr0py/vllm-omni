@@ -99,6 +99,12 @@ class SupportsStepExecution(Protocol):
     serving-scheduler cycle in between (a capability, not a policy: the runner
     that owns the scheduling decision chooses whether to group steps). It is
     optional so it does not become part of the runtime protocol check.
+
+    Pipelines may also implement the optional ``decode_preview(latents,
+    max_side) -> str | None`` hook: a cheap downscaled JPEG (b64) of in-flight
+    latents for SSE preview streaming. The runner calls it only for opted-in
+    requests (``extra_args["stream_progress"]``), on the primary rank, and
+    treats every failure as non-fatal.
     """
 
     supports_step_execution: ClassVar[bool] = True

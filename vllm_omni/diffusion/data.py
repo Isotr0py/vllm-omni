@@ -1856,6 +1856,19 @@ def is_diffusion_request_started_output(output: Any) -> bool:
     )
 
 
+DIFFUSION_PROGRESS_KEY = "progress"
+
+
+def is_diffusion_progress_output(output: Any) -> bool:
+    """Whether the output is a non-terminal denoise progress/preview chunk.
+
+    Works on both worker-side ``DiffusionOutput`` and served
+    ``OmniRequestOutput`` (both expose ``custom_output``).
+    """
+    custom_output = getattr(output, "custom_output", None)
+    return isinstance(custom_output, dict) and DIFFUSION_PROGRESS_KEY in custom_output
+
+
 @dataclass
 class DiffusionOutput:
     """
