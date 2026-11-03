@@ -28,11 +28,17 @@ equal to the DiT TP size, the Qwen3.5 text encoder is megatron-sharded over
 the same TP ranks via the checkpoint's HF ``tp_plan`` (encoder_vllm_tp.py);
 the sharded encoder is not weight-replicated, so DLO AllGather is rejected
 for it in that mode (use rank-local transfer).
+
+VAE memory: ``--vae-use-slicing`` / ``--vae-use-tiling`` enable diffusers'
+sliced/tiled fp32 decode, and ``--vae-patch-parallel-size`` > 1 wraps
+``vae.decode`` with the distributed tile/patch decoder over the TP group
+(vae_patch_parallel.py).
 """
 
 from __future__ import annotations
 
 import dataclasses
+import gc
 import math
 import os
 from collections.abc import Iterable, Iterator, Sequence
@@ -50,11 +56,16 @@ from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers import AutoConfig, AutoModel, AutoTokenizer
-from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    get_tp_group,
+)
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.distributed.vae_patch_parallel import maybe_wrap_vae_decode_with_patch_parallelism
 from vllm_omni.diffusion.guidance import (
     FlowMatchingPredictionAdapter,
     SkipLayerGuidanceConfig,
@@ -296,6 +307,21 @@ class MOSSImagePipeline(nn.Module, SkipLayerGuidanceMixin, DiffusionPipelineProf
 
         self.vae = self.vae.to(self.device)
         self.vae.eval()
+        # VAE memory levers. fp32 no-tiling decode of a 1024px latent peaks at
+        # several GiB of activations; on T4-class cards that OOMs even after TP
+        # sharding. Slicing/tiling bound the peak; patch parallelism splits the
+        # tiles across the TP ranks on top of that.
+        if od_config.vae_use_slicing:
+            self.vae.enable_slicing()
+        if od_config.vae_use_tiling:
+            self.vae.enable_tiling()
+        vae_pp_size = int(getattr(self.parallel_config, "vae_patch_parallel_size", 1) or 1)
+        if vae_pp_size > 1:
+            maybe_wrap_vae_decode_with_patch_parallelism(
+                self,
+                vae_patch_parallel_size=vae_pp_size,
+                group_getter=lambda: get_tp_group().device_group,
+            )
 
         transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, MOSSImageTransformer)
         self.transformer = MOSSImageTransformer(od_config=od_config, prefix="transformer", **transformer_kwargs)
@@ -432,6 +458,13 @@ class MOSSImagePipeline(nn.Module, SkipLayerGuidanceMixin, DiffusionPipelineProf
 
     def _vae_decode(self, latents: torch.Tensor) -> torch.Tensor:
         """fp32 VAE decode with BN-statistics denormalization and 2x2 unpacking."""
+        # Denoise activations are garbage at this point but still sit in the
+        # accelerator's caching allocator; return them to the driver before
+        # the fp32 decode peak (which OOMed T4-class cards by a few hundred
+        # MiB).
+        gc.collect()
+        if self.device.type != "cpu":
+            torch.accelerator.empty_cache()
         z = latents.to(dtype=self.vae.dtype)
         bn = self.vae.bn
         eps = self.vae.config.batch_norm_eps
