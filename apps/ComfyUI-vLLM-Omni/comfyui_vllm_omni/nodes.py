@@ -69,10 +69,15 @@ def _make_preview_callback():
             return
         try:
             import base64
+            import io
 
+            from PIL import Image
+
+            # send_image wants (image_type, PIL image, max_size), not raw bytes
+            pil_image = Image.open(io.BytesIO(base64.b64decode(b64_jpeg))).convert("RGB")
             PromptServer.instance.send_sync(
                 BinaryEventTypes.UNENCODED_PREVIEW_IMAGE,
-                base64.b64decode(b64_jpeg),
+                ("JPEG", pil_image, None),
                 None,
             )
         except Exception:  # previews are strictly best-effort
